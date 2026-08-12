@@ -17,6 +17,7 @@ limitations under the License.
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -59,6 +60,7 @@ type options struct {
 	fixTeamRepos          bool
 	fixRepos              bool
 	fixCollaborators      bool
+	fixRulesets           bool
 	ignoreInvitees        bool
 	ignoreSecretTeams     bool
 	ignoreEnterpriseTeams bool
@@ -97,6 +99,7 @@ func (o *options) parseArgs(flags *flag.FlagSet, args []string) error {
 	flags.BoolVar(&o.fixTeamRepos, "fix-team-repos", false, "Add/remove team permissions on repos if set")
 	flags.BoolVar(&o.fixRepos, "fix-repos", false, "Create/update repositories if set")
 	flags.BoolVar(&o.fixCollaborators, "fix-collaborators", false, "Add/remove/update repository collaborators if set")
+	flags.BoolVar(&o.fixRulesets, "fix-rulesets", false, "Create/update/delete repository rulesets if set")
 	flags.BoolVar(&o.allowRepoArchival, "allow-repo-archival", false, "If set, archiving repos is allowed while updating repos")
 	flags.BoolVar(&o.allowRepoPublish, "allow-repo-publish", false, "If set, making private repos public is allowed while updating repos")
 	flags.StringVar(&o.logLevel, "log-level", logrus.InfoLevel.String(), fmt.Sprintf("Logging level, one of %v", logrus.AllLevels))
@@ -275,11 +278,20 @@ func dumpOrgConfig(client dumpClient, orgName string, ignoreSecretTeams bool, ig
 	idMap := map[int]org.Team{} // metadata for a team
 	children := map[int][]int{} // what children does it have
 	var tops []int              // what are the top-level teams
+	enterpriseMembers := sets.New[string]()
 
 	for _, t := range teams {
 		logger := logrus.WithFields(logrus.Fields{"id": t.ID, "name": t.Name})
 		if ignoreEnterpriseTeams && t.Type == github.TeamTypeEnterprise {
 			logger.Debug("Skipping enterprise team.")
+			members, err := client.ListTeamMembersBySlug(orgName, t.Slug, github.RoleAll)
+			if err != nil {
+				logrus.WithError(err).Warnf("Failed to list enterprise team %s members for exclusion from org member list", t.Slug)
+			} else {
+				for _, m := range members {
+					enterpriseMembers.Insert(github.NormLogin(m.Login))
+				}
+			}
 			continue
 		}
 		p := org.Privacy(t.Privacy)
@@ -350,6 +362,24 @@ func dumpOrgConfig(client dumpClient, orgName string, ignoreSecretTeams bool, ig
 		return t
 	}
 
+	if enterpriseMembers.Len() > 0 {
+		filtered := out.Members[:0]
+		for _, m := range out.Members {
+			if !enterpriseMembers.Has(github.NormLogin(m)) {
+				filtered = append(filtered, m)
+			}
+		}
+		out.Members = filtered
+
+		filteredAdmins := out.Admins[:0]
+		for _, a := range out.Admins {
+			if !enterpriseMembers.Has(github.NormLogin(a)) {
+				filteredAdmins = append(filteredAdmins, a)
+			}
+		}
+		out.Admins = filteredAdmins
+	}
+
 	out.Teams = make(map[string]org.Team, len(tops))
 	for _, id := range tops {
 		out.Teams[names[id]] = makeChild(id)
@@ -399,13 +429,12 @@ type orgClient interface {
 	BotUser() (*github.UserData, error)
 	DeleteOrgInvitation(org string, invitationID int) error
 	ListOrgMembers(org, role string) ([]github.TeamMember, error)
-	ListTeams(org string) ([]github.Team, error)
 	ListTeamMembersBySlug(org, teamSlug, role string) ([]github.TeamMember, error)
 	RemoveOrgMembership(org, user string) error
 	UpdateOrgMembership(org, user string, admin bool) (*github.OrgMembership, error)
 }
 
-func configureOrgMembers(opt options, client orgClient, orgName string, orgConfig org.Config, invitees sets.Set[string], failedInvites map[string][]int) error {
+func configureOrgMembers(opt options, client orgClient, orgName string, orgConfig org.Config, allTeams []github.Team, invitees sets.Set[string], failedInvites map[string][]int) error {
 	// Get desired state
 	wantAdmins := sets.New[string](orgConfig.Admins...)
 	wantMembers := sets.New[string](orgConfig.Members...)
@@ -454,10 +483,6 @@ func configureOrgMembers(opt options, client orgClient, orgName string, orgConfi
 	want.normalize()
 
 	if opt.ignoreEnterpriseTeams {
-		allTeams, err := client.ListTeams(orgName)
-		if err != nil {
-			return fmt.Errorf("failed to list %s teams: %w", orgName, err)
-		}
 		enterpriseMembers := sets.Set[string]{}
 		for _, t := range allTeams {
 			if t.Type != github.TeamTypeEnterprise {
@@ -477,6 +502,8 @@ func configureOrgMembers(opt options, client orgClient, orgName string, orgConfi
 				len(enterpriseMembers), strings.Join(sets.List(enterpriseMembers), ", "))
 			have.super = have.super.Difference(enterpriseMembers)
 			have.members = have.members.Difference(enterpriseMembers)
+			want.super = want.super.Difference(enterpriseMembers)
+			want.members = want.members.Difference(enterpriseMembers)
 		}
 	}
 
@@ -704,13 +731,12 @@ func validateTeamNames(orgConfig org.Config) error {
 }
 
 type teamClient interface {
-	ListTeams(org string) ([]github.Team, error)
 	CreateTeam(org string, team github.Team) (*github.Team, error)
 	DeleteTeamBySlug(org, teamSlug string) error
 }
 
 // configureTeams returns the ids for all expected team names, creating/deleting teams as necessary.
-func configureTeams(client teamClient, orgName string, orgConfig org.Config, maxDelta float64, ignoreSecretTeams bool, ignoreEnterpriseTeams bool) (map[string]github.Team, error) {
+func configureTeams(client teamClient, orgName string, orgConfig org.Config, allTeams []github.Team, maxDelta float64, ignoreSecretTeams bool, ignoreEnterpriseTeams bool) (map[string]github.Team, error) {
 	if err := validateTeamNames(orgConfig); err != nil {
 		return nil, err
 	}
@@ -718,12 +744,8 @@ func configureTeams(client teamClient, orgName string, orgConfig org.Config, max
 	// What teams exist?
 	teams := map[string]github.Team{}
 	slugs := sets.Set[string]{}
-	teamList, err := client.ListTeams(orgName)
-	if err != nil {
-		return nil, fmt.Errorf("failed to list teams: %w", err)
-	}
-	logrus.Debugf("Found %d teams", len(teamList))
-	for _, t := range teamList {
+	logrus.Debugf("Found %d teams", len(allTeams))
+	for _, t := range allTeams {
 		if ignoreEnterpriseTeams && t.Type == github.TeamTypeEnterprise {
 			logrus.Infof("Skipping enterprise team %s(%s) — managed at the enterprise level", t.Slug, t.Name)
 			continue
@@ -735,7 +757,7 @@ func configureTeams(client teamClient, orgName string, orgConfig org.Config, max
 		slugs.Insert(t.Slug)
 	}
 	if ignoreSecretTeams {
-		logrus.Debugf("Found %d non-secret teams", len(teamList))
+		logrus.Debugf("Found %d non-secret teams", len(allTeams))
 	}
 
 	// What is the lowest ID for each team?
@@ -962,10 +984,18 @@ func configureOrg(opt options, client github.Client, orgName string, orgConfig o
 		return fmt.Errorf("failed to list %s failed invitations: %w", orgName, err)
 	}
 
+	var allTeams []github.Team
+	if (opt.fixOrgMembers && opt.ignoreEnterpriseTeams) || opt.fixTeams {
+		allTeams, err = client.ListTeams(orgName)
+		if err != nil {
+			return fmt.Errorf("failed to list %s teams: %w", orgName, err)
+		}
+	}
+
 	// Invite/remove/update members to the org.
 	if !opt.fixOrgMembers {
 		logrus.Infof("Skipping org member configuration")
-	} else if err := configureOrgMembers(opt, client, orgName, orgConfig, invitees, failedInvites); err != nil {
+	} else if err := configureOrgMembers(opt, client, orgName, orgConfig, allTeams, invitees, failedInvites); err != nil {
 		return fmt.Errorf("failed to configure %s members: %w", orgName, err)
 	}
 
@@ -989,29 +1019,43 @@ func configureOrg(opt options, client github.Client, orgName string, orgConfig o
 
 	if !opt.fixTeams {
 		logrus.Infof("Skipping team and team member configuration")
-		return nil
-	}
-
-	// Find the id and current state of each declared team (create/delete as necessary)
-	githubTeams, err := configureTeams(client, orgName, orgConfig, opt.maximumDelta, opt.ignoreSecretTeams, opt.ignoreEnterpriseTeams)
-	if err != nil {
-		return fmt.Errorf("failed to configure %s teams: %w", orgName, err)
-	}
-
-	for name, team := range orgConfig.Teams {
-		err := configureTeamAndMembers(opt, client, githubTeams, name, orgName, team, nil)
+	} else {
+		// Find the id and current state of each declared team (create/delete as necessary)
+		githubTeams, err := configureTeams(client, orgName, orgConfig, allTeams, opt.maximumDelta, opt.ignoreSecretTeams, opt.ignoreEnterpriseTeams)
 		if err != nil {
 			return fmt.Errorf("failed to configure %s teams: %w", orgName, err)
 		}
 
-		if !opt.fixTeamRepos {
-			logrus.Infof("Skipping team repo permissions configuration")
-			continue
-		}
-		if err := configureTeamRepos(client, githubTeams, name, orgName, team); err != nil {
-			return fmt.Errorf("failed to configure %s team %s repos: %w", orgName, name, err)
+		for name, team := range orgConfig.Teams {
+			err := configureTeamAndMembers(opt, client, githubTeams, name, orgName, team, nil)
+			if err != nil {
+				return fmt.Errorf("failed to configure %s teams: %w", orgName, err)
+			}
+
+			if !opt.fixTeamRepos {
+				logrus.Infof("Skipping team repo permissions configuration")
+				continue
+			}
+			if err := configureTeamRepos(client, githubTeams, name, orgName, team); err != nil {
+				return fmt.Errorf("failed to configure %s team %s repos: %w", orgName, name, err)
+			}
 		}
 	}
+
+	// Configure repository rulesets (after teams so team-repo permissions are in place)
+	if !opt.fixRulesets {
+		logrus.Info("Skipping repository rulesets configuration")
+	} else {
+		for repoName, repo := range orgConfig.Repos {
+			if len(repo.Rulesets) == 0 {
+				continue
+			}
+			if err := configureRepoRulesets(client, orgName, repoName, repo.Rulesets, allTeams); err != nil {
+				return fmt.Errorf("failed to configure %s/%s rulesets: %w", orgName, repoName, err)
+			}
+		}
+	}
+
 	return nil
 }
 
@@ -1457,6 +1501,316 @@ func configureTeam(client editTeamClient, orgName, teamName string, team org.Tea
 		}
 	}
 	return nil
+}
+
+const rulesetPrefix = "peribolos/"
+
+type rulesetClient interface {
+	ListRepoRulesets(org, repo string) ([]github.Ruleset, error)
+	GetRepoRuleset(org, repo string, rulesetID int) (*github.Ruleset, error)
+	CreateRepoRuleset(org, repo string, ruleset github.RulesetRequest) (*github.Ruleset, error)
+	UpdateRepoRuleset(org, repo string, rulesetID int, ruleset github.RulesetRequest) (*github.Ruleset, error)
+	DeleteRepoRuleset(org, repo string, rulesetID int) error
+}
+
+func configureRepoRulesets(client rulesetClient, orgName, repoName string, want []org.RepoRuleset, allTeams []github.Team) error {
+	teamsBySlug := map[string]github.Team{}
+	for _, t := range allTeams {
+		teamsBySlug[t.Slug] = t
+	}
+
+	current, err := client.ListRepoRulesets(orgName, repoName)
+	if err != nil {
+		return fmt.Errorf("listing rulesets: %w", err)
+	}
+
+	managed := map[string]github.Ruleset{}
+	for _, rs := range current {
+		if strings.HasPrefix(rs.Name, rulesetPrefix) {
+			managed[rs.Name] = rs
+		}
+	}
+
+	wantMap := map[string]org.RepoRuleset{}
+	for _, rs := range want {
+		wantMap[rs.Name] = rs
+	}
+
+	var errs []error
+
+	for name, w := range wantMap {
+		req := toRulesetRequest(w, teamsBySlug)
+		if existing, ok := managed[name]; ok {
+			full, err := client.GetRepoRuleset(orgName, repoName, existing.ID)
+			if err != nil {
+				errs = append(errs, fmt.Errorf("get ruleset %s: %w", name, err))
+				continue
+			}
+			if !rulesetNeedsUpdate(*full, req) {
+				logrus.WithField("ruleset", name).Info("Ruleset already up-to-date, skipping")
+				continue
+			}
+			logrus.WithField("ruleset", name).Info("Updating ruleset")
+			if _, err := client.UpdateRepoRuleset(orgName, repoName, existing.ID, req); err != nil {
+				errs = append(errs, fmt.Errorf("update ruleset %s: %w", name, err))
+			}
+		} else {
+			logrus.WithField("ruleset", name).Info("Creating ruleset")
+			if _, err := client.CreateRepoRuleset(orgName, repoName, req); err != nil {
+				errs = append(errs, fmt.Errorf("create ruleset %s: %w", name, err))
+			}
+		}
+	}
+
+	for name, existing := range managed {
+		if _, ok := wantMap[name]; !ok {
+			logrus.WithField("ruleset", name).Info("Deleting ruleset")
+			if err := client.DeleteRepoRuleset(orgName, repoName, existing.ID); err != nil {
+				errs = append(errs, fmt.Errorf("delete ruleset %s: %w", name, err))
+			}
+		}
+	}
+
+	return utilerrors.NewAggregate(errs)
+}
+
+func toRulesetRequest(rs org.RepoRuleset, teamsBySlug map[string]github.Team) github.RulesetRequest {
+	var bypassActors []github.RulesetBypassActor
+	for _, ba := range rs.BypassActors {
+		actor := github.RulesetBypassActor{
+			ActorID:    ba.ActorID,
+			ActorType:  ba.ActorType,
+			BypassMode: ba.BypassMode,
+		}
+		if ba.TeamSlug != "" && ba.ActorType == "Team" {
+			if team, ok := teamsBySlug[ba.TeamSlug]; ok {
+				id := team.ID
+				actor.ActorID = &id
+			} else {
+				logrus.WithField("team_slug", ba.TeamSlug).Warn("Team slug not found, skipping bypass actor")
+				continue
+			}
+		}
+		bypassActors = append(bypassActors, actor)
+	}
+
+	target := rs.Target
+	if target == "" {
+		target = "branch"
+	}
+
+	rules := resolveRuleTeamSlugs(rs.Rules, teamsBySlug)
+
+	return github.RulesetRequest{
+		Name:         rs.Name,
+		Target:       target,
+		Enforcement:  rs.Enforcement,
+		BypassActors: bypassActors,
+		Conditions:   rs.Conditions,
+		Rules:        rules,
+	}
+}
+
+func resolveRuleTeamSlugs(rules []github.RulesetRule, teamsBySlug map[string]github.Team) []github.RulesetRule {
+	resolved := make([]github.RulesetRule, len(rules))
+	for i, rule := range rules {
+		resolved[i] = rule
+		if rule.Type != "pull_request" || len(rule.Parameters) == 0 {
+			continue
+		}
+
+		var params map[string]interface{}
+		if err := json.Unmarshal(rule.Parameters, &params); err != nil {
+			continue
+		}
+
+		dr, ok := params["dismissal_restriction"]
+		if !ok {
+			continue
+		}
+		drMap, ok := dr.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		actors, ok := drMap["allowed_actors"]
+		if !ok {
+			continue
+		}
+		actorList, ok := actors.([]interface{})
+		if !ok {
+			continue
+		}
+
+		resolvedActors := make([]map[string]interface{}, 0, len(actorList))
+		for _, a := range actorList {
+			actor, ok := a.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			slug, _ := actor["team_slug"].(string)
+			actorType, _ := actor["type"].(string)
+			if slug != "" && actorType == "Team" {
+				if team, found := teamsBySlug[slug]; found {
+					resolvedActors = append(resolvedActors, map[string]interface{}{
+						"id":   team.ID,
+						"type": "Team",
+					})
+				} else {
+					logrus.WithField("team_slug", slug).Warn("Team slug not found in dismissal restriction, skipping")
+				}
+			} else {
+				delete(actor, "team_slug")
+				resolvedActors = append(resolvedActors, actor)
+			}
+		}
+
+		drMap["allowed_actors"] = resolvedActors
+		params["dismissal_restriction"] = drMap
+		data, err := json.Marshal(params)
+		if err != nil {
+			continue
+		}
+		resolved[i].Parameters = data
+	}
+	return resolved
+}
+
+func rulesetNeedsUpdate(have github.Ruleset, want github.RulesetRequest) bool {
+	if have.Name != want.Name || have.Enforcement != want.Enforcement {
+		return true
+	}
+	if have.Target != want.Target {
+		return true
+	}
+
+	if len(have.BypassActors) != len(want.BypassActors) {
+		return true
+	}
+	haveActors := map[string]bool{}
+	for _, a := range have.BypassActors {
+		key := fmt.Sprintf("%s:%d:%s", a.ActorType, ptrIntVal(a.ActorID), a.BypassMode)
+		haveActors[key] = true
+	}
+	for _, a := range want.BypassActors {
+		key := fmt.Sprintf("%s:%d:%s", a.ActorType, ptrIntVal(a.ActorID), a.BypassMode)
+		if !haveActors[key] {
+			return true
+		}
+	}
+
+	if !equalRulesetConditions(have.Conditions, want.Conditions) {
+		return true
+	}
+
+	if len(have.Rules) != len(want.Rules) {
+		return true
+	}
+	haveRules := map[string]json.RawMessage{}
+	for _, r := range have.Rules {
+		haveRules[r.Type] = r.Parameters
+	}
+	for _, r := range want.Rules {
+		haveParams, ok := haveRules[r.Type]
+		if !ok {
+			return true
+		}
+		if !ruleParamsMatch(haveParams, r.Parameters) {
+			return true
+		}
+	}
+
+	return false
+}
+
+func ruleParamsMatch(have, want json.RawMessage) bool {
+	if len(want) == 0 && len(have) == 0 {
+		return true
+	}
+	if len(want) == 0 || len(have) == 0 {
+		return len(want) == 0 && len(have) == 0
+	}
+
+	var haveMap, wantMap map[string]interface{}
+	if err := json.Unmarshal(have, &haveMap); err != nil {
+		return string(have) == string(want)
+	}
+	if err := json.Unmarshal(want, &wantMap); err != nil {
+		return string(have) == string(want)
+	}
+
+	for key, wantVal := range wantMap {
+		haveVal, ok := haveMap[key]
+		if !ok {
+			return false
+		}
+		wantJSON, _ := json.Marshal(wantVal)
+		haveJSON, _ := json.Marshal(haveVal)
+		if string(wantJSON) != string(haveJSON) {
+			return false
+		}
+	}
+	return true
+}
+
+func normalizeJSON(raw json.RawMessage) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	var v interface{}
+	if err := json.Unmarshal(raw, &v); err != nil {
+		return string(raw)
+	}
+	normalized, err := json.Marshal(v)
+	if err != nil {
+		return string(raw)
+	}
+	return string(normalized)
+}
+
+func ptrIntVal(p *int) int {
+	if p == nil {
+		return 0
+	}
+	return *p
+}
+
+func equalRulesetConditions(have *github.RulesetConditions, want *github.RulesetConditions) bool {
+	if have == nil && want == nil {
+		return true
+	}
+	if have == nil || want == nil {
+		return false
+	}
+	if have.RefName == nil && want.RefName == nil {
+		return true
+	}
+	if have.RefName == nil || want.RefName == nil {
+		return false
+	}
+	return equalSortedStrings(have.RefName.Include, want.RefName.Include) &&
+		equalSortedStrings(have.RefName.Exclude, want.RefName.Exclude)
+}
+
+func equalSortedStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	sa := sets.New[string](a...)
+	sb := sets.New[string](b...)
+	return sa.Equal(sb)
+}
+
+// marshalRuleParams marshals rule parameters to json.RawMessage for API requests.
+func marshalRuleParams(params interface{}) json.RawMessage {
+	if params == nil {
+		return nil
+	}
+	data, err := json.Marshal(params)
+	if err != nil {
+		logrus.WithError(err).Warn("Failed to marshal rule parameters")
+		return nil
+	}
+	return data
 }
 
 type teamRepoClient interface {

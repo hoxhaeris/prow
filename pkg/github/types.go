@@ -1764,3 +1764,100 @@ type Layers struct {
 	MediaType string `json:"media_type"`
 	Size      int    `json:"size"`
 }
+
+// Ruleset represents a GitHub repository or organization ruleset.
+// See https://docs.github.com/en/rest/repos/rules
+type Ruleset struct {
+	ID                   int                 `json:"id"`
+	Name                 string              `json:"name"`
+	Target               string              `json:"target,omitempty"`
+	Enforcement          string              `json:"enforcement"`
+	SourceType           string              `json:"source_type,omitempty"`
+	Source               string              `json:"source,omitempty"`
+	NodeID               string              `json:"node_id,omitempty"`
+	BypassActors         []RulesetBypassActor `json:"bypass_actors,omitempty"`
+	Conditions           *RulesetConditions   `json:"conditions,omitempty"`
+	Rules                []RulesetRule        `json:"rules,omitempty"`
+	CurrentUserCanBypass string              `json:"current_user_can_bypass,omitempty"`
+	CreatedAt            string              `json:"created_at,omitempty"`
+	UpdatedAt            string              `json:"updated_at,omitempty"`
+}
+
+// RulesetBypassActor specifies an actor that can bypass ruleset rules.
+type RulesetBypassActor struct {
+	ActorID    *int   `json:"actor_id"`
+	ActorType  string `json:"actor_type"`
+	BypassMode string `json:"bypass_mode"`
+}
+
+// RulesetConditions specifies which refs and repos a ruleset applies to.
+type RulesetConditions struct {
+	RefName        *RulesetRefNameCondition        `json:"ref_name,omitempty"`
+	RepositoryName *RulesetRepositoryNameCondition `json:"repository_name,omitempty"`
+}
+
+// RulesetRefNameCondition specifies branch/tag patterns to include or exclude.
+type RulesetRefNameCondition struct {
+	Include []string `json:"include"`
+	Exclude []string `json:"exclude"`
+}
+
+// RulesetRepositoryNameCondition specifies repository name patterns for org-level rulesets.
+type RulesetRepositoryNameCondition struct {
+	Include   []string `json:"include"`
+	Exclude   []string `json:"exclude"`
+	Protected *bool    `json:"protected,omitempty"`
+}
+
+// RulesetRule is a single rule within a ruleset.
+// Parameters is type-specific; use json.RawMessage to defer parsing.
+type RulesetRule struct {
+	Type       string          `json:"type"`
+	Parameters json.RawMessage `json:"parameters,omitempty"`
+}
+
+// RulesetStatusChecksParams holds parameters for the required_status_checks rule type.
+type RulesetStatusChecksParams struct {
+	StrictRequiredStatusChecksPolicy bool                 `json:"strict_required_status_checks_policy"`
+	DoNotEnforceOnCreate             bool                 `json:"do_not_enforce_on_create,omitempty"`
+	RequiredStatusChecks             []RulesetStatusCheck `json:"required_status_checks"`
+}
+
+// RulesetStatusCheck identifies a required status check context.
+type RulesetStatusCheck struct {
+	Context       string `json:"context"`
+	IntegrationID *int   `json:"integration_id,omitempty"`
+}
+
+// RulesetPullRequestParams holds parameters for the pull_request rule type.
+type RulesetPullRequestParams struct {
+	DismissStaleReviewsOnPush      bool                        `json:"dismiss_stale_reviews_on_push"`
+	RequireCodeOwnerReview         bool                        `json:"require_code_owner_review"`
+	RequireLastPushApproval        bool                        `json:"require_last_push_approval"`
+	RequiredApprovingReviewCount   int                         `json:"required_approving_review_count"`
+	RequiredReviewThreadResolution bool                        `json:"required_review_thread_resolution"`
+	DismissalRestriction           *RulesetDismissalRestriction `json:"dismissal_restriction,omitempty"`
+}
+
+// RulesetDismissalRestriction specifies who can dismiss reviews.
+type RulesetDismissalRestriction struct {
+	Enabled       bool                    `json:"enabled"`
+	AllowedActors []RulesetDismissalActor `json:"allowed_actors,omitempty"`
+}
+
+// RulesetDismissalActor identifies a user or team allowed to dismiss reviews.
+type RulesetDismissalActor struct {
+	ID   int    `json:"id"`
+	Type string `json:"type"`
+}
+
+// RulesetRequest is the body for creating or updating a ruleset.
+// All fields are optional on update (partial update).
+type RulesetRequest struct {
+	Name         string               `json:"name,omitempty"`
+	Target       string               `json:"target,omitempty"`
+	Enforcement  string               `json:"enforcement,omitempty"`
+	BypassActors []RulesetBypassActor `json:"bypass_actors,omitempty"`
+	Conditions   *RulesetConditions   `json:"conditions,omitempty"`
+	Rules        []RulesetRule        `json:"rules,omitempty"`
+}

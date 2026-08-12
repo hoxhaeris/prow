@@ -77,6 +77,28 @@ type Repo struct {
 	Collaborators map[string]github.RepoPermissionLevel `json:"collaborators,omitempty"`
 
 	OnCreate *RepoCreateOptions `json:"on_create,omitempty"`
+
+	Rulesets []RepoRuleset `json:"rulesets,omitempty"`
+}
+
+// RepoRuleset declares a GitHub Ruleset for a repository, managed by peribolos.
+// See https://docs.github.com/en/rest/repos/rules
+type RepoRuleset struct {
+	Name         string                     `json:"name"`
+	Target       string                     `json:"target,omitempty"`
+	Enforcement  string                     `json:"enforcement"`
+	BypassActors []RepoRulesetBypassActor   `json:"bypass_actors,omitempty"`
+	Conditions   *github.RulesetConditions  `json:"conditions,omitempty"`
+	Rules        []github.RulesetRule       `json:"rules,omitempty"`
+}
+
+// RepoRulesetBypassActor extends github.RulesetBypassActor with a team_slug field
+// that peribolos resolves to a numeric actor_id at reconciliation time.
+type RepoRulesetBypassActor struct {
+	ActorID    *int   `json:"actor_id,omitempty"`
+	ActorType  string `json:"actor_type"`
+	BypassMode string `json:"bypass_mode"`
+	TeamSlug   string `json:"team_slug,omitempty"`
 }
 
 // Config declares org metadata as well as its people and teams.

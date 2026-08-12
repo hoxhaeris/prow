@@ -208,6 +208,11 @@ type RepositoryClient interface {
 	CreateRepo(owner string, isUser bool, repo RepoCreateRequest) (*FullRepo, error)
 	UpdateRepo(owner, name string, repo RepoUpdateRequest) (*FullRepo, error)
 	ListRepoInvitations(org, repo string) ([]CollaboratorRepoInvitation, error)
+	ListRepoRulesets(org, repo string) ([]Ruleset, error)
+	GetRepoRuleset(org, repo string, rulesetID int) (*Ruleset, error)
+	CreateRepoRuleset(org, repo string, ruleset RulesetRequest) (*Ruleset, error)
+	UpdateRepoRuleset(org, repo string, rulesetID int, ruleset RulesetRequest) (*Ruleset, error)
+	DeleteRepoRuleset(org, repo string, rulesetID int) error
 }
 
 // TeamClient interface for team related API actions
@@ -2941,6 +2946,121 @@ func (c *client) DisableCommitSignProtection(org, repo, branch string) error {
 	_, err := c.request(&request{
 		method:    http.MethodDelete,
 		path:      fmt.Sprintf("/repos/%s/%s/branches/%s/protection/required_signatures", org, repo, branch),
+		org:       org,
+		exitCodes: []int{204},
+	}, nil)
+	return err
+}
+
+// ListRepoRulesets lists rulesets for a repository, excluding inherited org/enterprise rulesets.
+//
+// See https://docs.github.com/en/rest/repos/rules#get-all-repository-rulesets
+func (c *client) ListRepoRulesets(org, repo string) ([]Ruleset, error) {
+	durationLogger := c.log("ListRepoRulesets", org, repo)
+	defer durationLogger()
+
+	if c.fake {
+		return nil, nil
+	}
+	path := fmt.Sprintf("/repos/%s/%s/rulesets?includes_parents=false", org, repo)
+	var rulesets []Ruleset
+	err := c.readPaginatedResults(
+		path,
+		"application/vnd.github+json",
+		org,
+		func() interface{} {
+			return &[]Ruleset{}
+		},
+		func(obj interface{}) {
+			rulesets = append(rulesets, *(obj.(*[]Ruleset))...)
+		},
+	)
+	if err != nil {
+		return nil, err
+	}
+	return rulesets, nil
+}
+
+// GetRepoRuleset gets a single repository ruleset by ID.
+//
+// See https://docs.github.com/en/rest/repos/rules#get-a-repository-ruleset
+func (c *client) GetRepoRuleset(org, repo string, rulesetID int) (*Ruleset, error) {
+	durationLogger := c.log("GetRepoRuleset", org, repo, rulesetID)
+	defer durationLogger()
+
+	var ruleset Ruleset
+	_, err := c.request(&request{
+		method:    http.MethodGet,
+		path:      fmt.Sprintf("/repos/%s/%s/rulesets/%d", org, repo, rulesetID),
+		org:       org,
+		exitCodes: []int{200},
+	}, &ruleset)
+	if err != nil {
+		return nil, err
+	}
+	return &ruleset, nil
+}
+
+// CreateRepoRuleset creates a new ruleset for a repository.
+//
+// See https://docs.github.com/en/rest/repos/rules#create-a-repository-ruleset
+func (c *client) CreateRepoRuleset(org, repo string, ruleset RulesetRequest) (*Ruleset, error) {
+	durationLogger := c.log("CreateRepoRuleset", org, repo, ruleset.Name)
+	defer durationLogger()
+
+	if c.dry {
+		return &Ruleset{ID: 0, Name: ruleset.Name, Enforcement: ruleset.Enforcement}, nil
+	}
+	var created Ruleset
+	_, err := c.request(&request{
+		method:      http.MethodPost,
+		path:        fmt.Sprintf("/repos/%s/%s/rulesets", org, repo),
+		accept:      "application/vnd.github+json",
+		org:         org,
+		requestBody: &ruleset,
+		exitCodes:   []int{201},
+	}, &created)
+	if err != nil {
+		return nil, err
+	}
+	return &created, nil
+}
+
+// UpdateRepoRuleset updates an existing repository ruleset by ID.
+//
+// See https://docs.github.com/en/rest/repos/rules#update-a-repository-ruleset
+func (c *client) UpdateRepoRuleset(org, repo string, rulesetID int, ruleset RulesetRequest) (*Ruleset, error) {
+	durationLogger := c.log("UpdateRepoRuleset", org, repo, rulesetID)
+	defer durationLogger()
+
+	if c.dry {
+		return &Ruleset{ID: rulesetID, Name: ruleset.Name, Enforcement: ruleset.Enforcement}, nil
+	}
+	var updated Ruleset
+	_, err := c.request(&request{
+		method:      http.MethodPut,
+		path:        fmt.Sprintf("/repos/%s/%s/rulesets/%d", org, repo, rulesetID),
+		accept:      "application/vnd.github+json",
+		org:         org,
+		requestBody: &ruleset,
+		exitCodes:   []int{200},
+	}, &updated)
+	if err != nil {
+		return nil, err
+	}
+	return &updated, nil
+}
+
+// DeleteRepoRuleset deletes a repository ruleset by ID.
+//
+// See https://docs.github.com/en/rest/repos/rules#delete-a-repository-ruleset
+func (c *client) DeleteRepoRuleset(org, repo string, rulesetID int) error {
+	durationLogger := c.log("DeleteRepoRuleset", org, repo, rulesetID)
+	defer durationLogger()
+
+	_, err := c.request(&request{
+		method:    http.MethodDelete,
+		path:      fmt.Sprintf("/repos/%s/%s/rulesets/%d", org, repo, rulesetID),
 		org:       org,
 		exitCodes: []int{204},
 	}, nil)
