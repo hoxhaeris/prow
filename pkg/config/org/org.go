@@ -99,6 +99,8 @@ type RepoRulesetBypassActor struct {
 	ActorType  string `json:"actor_type"`
 	BypassMode string `json:"bypass_mode"`
 	TeamSlug   string `json:"team_slug,omitempty"`
+	UserLogin  string `json:"user_login,omitempty"`
+	AppSlug    string `json:"app_slug,omitempty"`
 }
 
 // Config declares org metadata as well as its people and teams.

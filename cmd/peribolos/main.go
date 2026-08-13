@@ -1511,6 +1511,8 @@ type rulesetClient interface {
 	CreateRepoRuleset(org, repo string, ruleset github.RulesetRequest) (*github.Ruleset, error)
 	UpdateRepoRuleset(org, repo string, rulesetID int, ruleset github.RulesetRequest) (*github.Ruleset, error)
 	DeleteRepoRuleset(org, repo string, rulesetID int) error
+	ListCollaborators(org, repo string) ([]github.User, error)
+	ListAppInstallationsForOrg(org string) ([]github.AppInstallation, error)
 }
 
 func configureRepoRulesets(client rulesetClient, orgName, repoName string, want []org.RepoRuleset, allTeams []github.Team) error {
@@ -1518,6 +1520,8 @@ func configureRepoRulesets(client rulesetClient, orgName, repoName string, want 
 	for _, t := range allTeams {
 		teamsBySlug[t.Slug] = t
 	}
+
+	usersByLogin, appsBySlug := resolveActorLookups(client, orgName, want)
 
 	current, err := client.ListRepoRulesets(orgName, repoName)
 	if err != nil {
@@ -1539,7 +1543,7 @@ func configureRepoRulesets(client rulesetClient, orgName, repoName string, want 
 	var errs []error
 
 	for name, w := range wantMap {
-		req := toRulesetRequest(w, teamsBySlug)
+		req := toRulesetRequest(w, teamsBySlug, usersByLogin, appsBySlug)
 		if existing, ok := managed[name]; ok {
 			full, err := client.GetRepoRuleset(orgName, repoName, existing.ID)
 			if err != nil {
@@ -1574,7 +1578,7 @@ func configureRepoRulesets(client rulesetClient, orgName, repoName string, want 
 	return utilerrors.NewAggregate(errs)
 }
 
-func toRulesetRequest(rs org.RepoRuleset, teamsBySlug map[string]github.Team) github.RulesetRequest {
+func toRulesetRequest(rs org.RepoRuleset, teamsBySlug map[string]github.Team, usersByLogin map[string]int, appsBySlug map[string]int) github.RulesetRequest {
 	var bypassActors []github.RulesetBypassActor
 	for _, ba := range rs.BypassActors {
 		actor := github.RulesetBypassActor{
@@ -1591,6 +1595,22 @@ func toRulesetRequest(rs org.RepoRuleset, teamsBySlug map[string]github.Team) gi
 				continue
 			}
 		}
+		if ba.UserLogin != "" && ba.ActorType == "User" {
+			if userID, ok := usersByLogin[ba.UserLogin]; ok {
+				actor.ActorID = &userID
+			} else {
+				logrus.WithField("user_login", ba.UserLogin).Warn("User login not resolved, skipping bypass actor")
+				continue
+			}
+		}
+		if ba.AppSlug != "" && ba.ActorType == "Integration" {
+			if appID, ok := appsBySlug[ba.AppSlug]; ok {
+				actor.ActorID = &appID
+			} else {
+				logrus.WithField("app_slug", ba.AppSlug).Warn("App slug not resolved, skipping bypass actor")
+				continue
+			}
+		}
 		bypassActors = append(bypassActors, actor)
 	}
 
@@ -1599,7 +1619,7 @@ func toRulesetRequest(rs org.RepoRuleset, teamsBySlug map[string]github.Team) gi
 		target = "branch"
 	}
 
-	rules := resolveRuleTeamSlugs(rs.Rules, teamsBySlug)
+	rules := resolveRuleActorSlugs(rs.Rules, teamsBySlug, usersByLogin)
 
 	return github.RulesetRequest{
 		Name:         rs.Name,
@@ -1611,7 +1631,7 @@ func toRulesetRequest(rs org.RepoRuleset, teamsBySlug map[string]github.Team) gi
 	}
 }
 
-func resolveRuleTeamSlugs(rules []github.RulesetRule, teamsBySlug map[string]github.Team) []github.RulesetRule {
+func resolveRuleActorSlugs(rules []github.RulesetRule, teamsBySlug map[string]github.Team, usersByLogin map[string]int) []github.RulesetRule {
 	resolved := make([]github.RulesetRule, len(rules))
 	for i, rule := range rules {
 		resolved[i] = rule
@@ -1647,9 +1667,9 @@ func resolveRuleTeamSlugs(rules []github.RulesetRule, teamsBySlug map[string]git
 			if !ok {
 				continue
 			}
-			slug, _ := actor["team_slug"].(string)
 			actorType, _ := actor["type"].(string)
-			if slug != "" && actorType == "Team" {
+
+			if slug, _ := actor["team_slug"].(string); slug != "" && actorType == "Team" {
 				if team, found := teamsBySlug[slug]; found {
 					resolvedActors = append(resolvedActors, map[string]interface{}{
 						"id":   team.ID,
@@ -1658,8 +1678,18 @@ func resolveRuleTeamSlugs(rules []github.RulesetRule, teamsBySlug map[string]git
 				} else {
 					logrus.WithField("team_slug", slug).Warn("Team slug not found in dismissal restriction, skipping")
 				}
+			} else if login, _ := actor["user_login"].(string); login != "" && actorType == "User" {
+				if userID, found := usersByLogin[login]; found {
+					resolvedActors = append(resolvedActors, map[string]interface{}{
+						"id":   userID,
+						"type": "User",
+					})
+				} else {
+					logrus.WithField("user_login", login).Warn("User login not resolved in dismissal restriction, skipping")
+				}
 			} else {
 				delete(actor, "team_slug")
+				delete(actor, "user_login")
 				resolvedActors = append(resolvedActors, actor)
 			}
 		}
@@ -1673,6 +1703,43 @@ func resolveRuleTeamSlugs(rules []github.RulesetRule, teamsBySlug map[string]git
 		resolved[i].Parameters = data
 	}
 	return resolved
+}
+
+func resolveActorLookups(client rulesetClient, orgName string, rulesets []org.RepoRuleset) (usersByLogin map[string]int, appsBySlug map[string]int) {
+	usersByLogin = map[string]int{}
+	appsBySlug = map[string]int{}
+
+	neededUsers := sets.New[string]()
+	needsApps := false
+	for _, rs := range rulesets {
+		for _, ba := range rs.BypassActors {
+			if ba.UserLogin != "" {
+				neededUsers.Insert(ba.UserLogin)
+			}
+			if ba.AppSlug != "" {
+				needsApps = true
+			}
+		}
+	}
+
+	if needsApps {
+		installations, err := client.ListAppInstallationsForOrg(orgName)
+		if err != nil {
+			logrus.WithError(err).Warn("Failed to list app installations, app slug resolution will fail")
+		} else {
+			for _, inst := range installations {
+				if inst.AppSlug != "" {
+					appsBySlug[inst.AppSlug] = int(inst.ID)
+				}
+			}
+		}
+	}
+
+	if neededUsers.Len() > 0 {
+		logrus.WithField("users", neededUsers.UnsortedList()).Info("User login-to-ID resolution needed; user IDs must be provided in config or resolved externally")
+	}
+
+	return usersByLogin, appsBySlug
 }
 
 func rulesetNeedsUpdate(have github.Ruleset, want github.RulesetRequest) bool {
