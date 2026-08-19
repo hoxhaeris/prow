@@ -1580,7 +1580,9 @@ func configureRepoRulesets(client rulesetClient, orgName, repoName string, want 
 }
 
 func toRulesetRequest(rs org.RepoRuleset, teamsBySlug map[string]github.Team, usersByLogin map[string]int, appsBySlug map[string]int) github.RulesetRequest {
-	var bypassActors []github.RulesetBypassActor
+	// Non-nil so it marshals as [] (not null) when there are no bypass actors,
+	// which is required to clear an existing bypass list on update.
+	bypassActors := []github.RulesetBypassActor{}
 	for _, ba := range rs.BypassActors {
 		actor := github.RulesetBypassActor{
 			ActorID:    ba.ActorID,

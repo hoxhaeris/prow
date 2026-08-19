@@ -1857,7 +1857,10 @@ type RulesetRequest struct {
 	Name         string               `json:"name,omitempty"`
 	Target       string               `json:"target,omitempty"`
 	Enforcement  string               `json:"enforcement,omitempty"`
-	BypassActors []RulesetBypassActor `json:"bypass_actors,omitempty"`
+	// BypassActors is intentionally not omitempty: an empty slice must be sent as
+	// [] so an update that removes all bypass actors (e.g. expired bootstrap access)
+	// actually clears them instead of being omitted and leaving the old list.
+	BypassActors []RulesetBypassActor `json:"bypass_actors"`
 	Conditions   *RulesetConditions   `json:"conditions,omitempty"`
 	Rules        []RulesetRule        `json:"rules,omitempty"`
 }
