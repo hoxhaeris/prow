@@ -1513,6 +1513,7 @@ type rulesetClient interface {
 	DeleteRepoRuleset(org, repo string, rulesetID int) error
 	ListCollaborators(org, repo string) ([]github.User, error)
 	ListAppInstallationsForOrg(org string) ([]github.AppInstallation, error)
+	GetUser(login string) (*github.User, error)
 }
 
 func configureRepoRulesets(client rulesetClient, orgName, repoName string, want []org.RepoRuleset, allTeams []github.Team) error {
@@ -1735,8 +1736,13 @@ func resolveActorLookups(client rulesetClient, orgName string, rulesets []org.Re
 		}
 	}
 
-	if neededUsers.Len() > 0 {
-		logrus.WithField("users", neededUsers.UnsortedList()).Info("User login-to-ID resolution needed; user IDs must be provided in config or resolved externally")
+	for _, login := range sets.List(neededUsers) {
+		user, err := client.GetUser(login)
+		if err != nil {
+			logrus.WithError(err).WithField("user_login", login).Warn("Failed to resolve user login to ID, bypass actor will be skipped")
+			continue
+		}
+		usersByLogin[login] = user.ID
 	}
 
 	return usersByLogin, appsBySlug

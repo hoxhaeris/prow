@@ -175,6 +175,16 @@ func (f *FakeClient) BotUser() (*github.UserData, error) {
 	return &github.UserData{Login: botName}, nil
 }
 
+// GetUser returns a user for the given login. The numeric ID is derived
+// deterministically from the login so tests get stable, non-zero IDs.
+func (f *FakeClient) GetUser(login string) (*github.User, error) {
+	id := 0
+	for _, r := range login {
+		id = id*31 + int(r)
+	}
+	return &github.User{Login: login, ID: id}, nil
+}
+
 func (f *FakeClient) BotUserCheckerWithContext(_ context.Context) (func(candidate string) bool, error) {
 	return f.BotUserChecker()
 }

@@ -244,6 +244,8 @@ type UserClient interface {
 	BotUserChecker() (func(candidate string) bool, error)
 	BotUserCheckerWithContext(ctx context.Context) (func(candidate string) bool, error)
 	Email() (string, error)
+	// GetUser fetches a user by login, e.g. to resolve a login to its numeric ID.
+	GetUser(login string) (*User, error)
 }
 
 // ProjectClient interface for project related API actions
@@ -2983,6 +2985,26 @@ func (c *client) ListRepoRulesets(org, repo string) ([]Ruleset, error) {
 
 // GetRepoRuleset gets a single repository ruleset by ID.
 //
+// GetUser fetches a user by login, primarily to resolve a login to its numeric
+// account ID (needed for ruleset bypass actors of type User).
+//
+// See https://docs.github.com/en/rest/users/users#get-a-user
+func (c *client) GetUser(login string) (*User, error) {
+	durationLogger := c.log("GetUser", login)
+	defer durationLogger()
+
+	var user User
+	_, err := c.request(&request{
+		method:    http.MethodGet,
+		path:      fmt.Sprintf("/users/%s", login),
+		exitCodes: []int{200},
+	}, &user)
+	if err != nil {
+		return nil, err
+	}
+	return &user, nil
+}
+
 // See https://docs.github.com/en/rest/repos/rules#get-a-repository-ruleset
 func (c *client) GetRepoRuleset(org, repo string, rulesetID int) (*Ruleset, error) {
 	durationLogger := c.log("GetRepoRuleset", org, repo, rulesetID)
