@@ -497,13 +497,15 @@ func configureOrgMembers(opt options, client orgClient, orgName string, orgConfi
 				enterpriseMembers.Insert(github.NormLogin(m.Login))
 			}
 		}
+		// Members explicitly listed in the config take precedence over their implicit
+		// enterprise-team membership: only exclude enterprise members the config does
+		// not mention, so a configured role is still honored for the rest.
+		enterpriseMembers = enterpriseMembers.Difference(want.super).Difference(want.members)
 		if len(enterpriseMembers) > 0 {
 			logrus.Infof("Excluding %d enterprise team members from org member reconciliation: %s",
 				len(enterpriseMembers), strings.Join(sets.List(enterpriseMembers), ", "))
 			have.super = have.super.Difference(enterpriseMembers)
 			have.members = have.members.Difference(enterpriseMembers)
-			want.super = want.super.Difference(enterpriseMembers)
-			want.members = want.members.Difference(enterpriseMembers)
 		}
 	}
 
@@ -1046,10 +1048,11 @@ func configureOrg(opt options, client github.Client, orgName string, orgConfig o
 	if !opt.fixRulesets {
 		logrus.Info("Skipping repository rulesets configuration")
 	} else {
+		// Reconcile every configured repo, not only those declaring rulesets, so that
+		// removing all rulesets from a repo's config cleans up its managed rulesets
+		// instead of orphaning them. Name-prefix scoping in configureRepoRulesets keeps
+		// manually-created (non-"peribolos/") rulesets untouched.
 		for repoName, repo := range orgConfig.Repos {
-			if len(repo.Rulesets) == 0 {
-				continue
-			}
 			if err := configureRepoRulesets(client, orgName, repoName, repo.Rulesets, allTeams); err != nil {
 				return fmt.Errorf("failed to configure %s/%s rulesets: %w", orgName, repoName, err)
 			}
@@ -1511,7 +1514,6 @@ type rulesetClient interface {
 	CreateRepoRuleset(org, repo string, ruleset github.RulesetRequest) (*github.Ruleset, error)
 	UpdateRepoRuleset(org, repo string, rulesetID int, ruleset github.RulesetRequest) (*github.Ruleset, error)
 	DeleteRepoRuleset(org, repo string, rulesetID int) error
-	ListCollaborators(org, repo string) ([]github.User, error)
 	ListAppInstallationsForOrg(org string) ([]github.AppInstallation, error)
 	GetUser(login string) (*github.User, error)
 }
@@ -1827,21 +1829,6 @@ func ruleParamsMatch(have, want json.RawMessage) bool {
 	return true
 }
 
-func normalizeJSON(raw json.RawMessage) string {
-	if len(raw) == 0 {
-		return ""
-	}
-	var v interface{}
-	if err := json.Unmarshal(raw, &v); err != nil {
-		return string(raw)
-	}
-	normalized, err := json.Marshal(v)
-	if err != nil {
-		return string(raw)
-	}
-	return string(normalized)
-}
-
 func ptrIntVal(p *int) int {
 	if p == nil {
 		return 0
@@ -1873,19 +1860,6 @@ func equalSortedStrings(a, b []string) bool {
 	sa := sets.New[string](a...)
 	sb := sets.New[string](b...)
 	return sa.Equal(sb)
-}
-
-// marshalRuleParams marshals rule parameters to json.RawMessage for API requests.
-func marshalRuleParams(params interface{}) json.RawMessage {
-	if params == nil {
-		return nil
-	}
-	data, err := json.Marshal(params)
-	if err != nil {
-		logrus.WithError(err).Warn("Failed to marshal rule parameters")
-		return nil
-	}
-	return data
 }
 
 type teamRepoClient interface {

@@ -825,7 +825,12 @@ func TestConfigureOrgMembers(t *testing.T) {
 				failedInvites:   tc.failedInvites,
 			}
 
-			err := configureOrgMembers(tc.opt, fc, fakeOrg, tc.config, sets.New[string](tc.invitations...), tc.failedInvites)
+			// configureOrg lists teams once and passes them down; mirror that here so
+			// the ListTeams failure path (moved up to configureOrg) is still exercised.
+			allTeams, err := fc.ListTeams(fakeOrg)
+			if err == nil {
+				err = configureOrgMembers(tc.opt, fc, fakeOrg, tc.config, allTeams, sets.New[string](tc.invitations...), tc.failedInvites)
+			}
 			switch {
 			case err != nil:
 				if !tc.err {
@@ -1260,7 +1265,13 @@ func TestConfigureTeams(t *testing.T) {
 			if tc.delta == 0 {
 				tc.delta = 1
 			}
-			actual, err := configureTeams(fc, orgName, tc.config, tc.delta, tc.ignoreSecretTeams, tc.ignoreEnterpriseTeams)
+			// configureOrg lists teams once and passes them to configureTeams; mirror that
+			// here so the ListTeams failure path is still exercised.
+			allTeams, err := fc.ListTeams(orgName)
+			var actual map[string]github.Team
+			if err == nil {
+				actual, err = configureTeams(fc, orgName, tc.config, allTeams, tc.delta, tc.ignoreSecretTeams, tc.ignoreEnterpriseTeams)
+			}
 			switch {
 			case err != nil:
 				if !tc.err {
@@ -1948,6 +1959,7 @@ func TestDumpOrgConfig(t *testing.T) {
 		teams                 []github.Team
 		teamMembers           map[string][]string
 		maintainers           map[string][]string
+		enterpriseMembers     map[string][]string
 		repoPermissions       map[string][]github.Repo
 		repos                 []github.FullRepo
 		expected              org.Config
@@ -2299,6 +2311,72 @@ func TestDumpOrgConfig(t *testing.T) {
 				Repos:   map[string]org.Repo{},
 			},
 		},
+		{
+			name:                  "excludes enterprise members that are also org members or admins",
+			ignoreEnterpriseTeams: true,
+			meta: github.Organization{
+				Name:                         hello,
+				MembersCanCreateRepositories: yes,
+				DefaultRepositoryPermission:  string(perm),
+			},
+			members: []string{"george", "ent-member"},
+			admins:  []string{"admin", "ent-admin"},
+			teams: []github.Team{
+				{
+					ID:          5,
+					Slug:        "team-5",
+					Name:        "friends",
+					Description: details,
+				},
+				{
+					ID:   9,
+					Slug: "ent-security",
+					Name: "ent-security",
+					Type: github.TeamTypeEnterprise,
+				},
+			},
+			teamMembers: map[string][]string{
+				"team-5": {"george"},
+			},
+			maintainers: map[string][]string{
+				"team-5": {},
+			},
+			enterpriseMembers: map[string][]string{
+				"ent-security": {"ent-member", "ent-admin"},
+			},
+			repoPermissions: map[string][]github.Repo{
+				"team-5": {},
+			},
+			expected: org.Config{
+				Metadata: org.Metadata{
+					Name:                         &hello,
+					BillingEmail:                 &empty,
+					Company:                      &empty,
+					Email:                        &empty,
+					Description:                  &empty,
+					Location:                     &empty,
+					HasOrganizationProjects:      &no,
+					HasRepositoryProjects:        &no,
+					DefaultRepositoryPermission:  &perm,
+					MembersCanCreateRepositories: &yes,
+				},
+				Teams: map[string]org.Team{
+					"friends": {
+						TeamMetadata: org.TeamMetadata{
+							Description: &details,
+							Privacy:     &pub,
+						},
+						Members:     []string{"george"},
+						Maintainers: []string{},
+						Children:    map[string]org.Team{},
+						Repos:       map[string]github.RepoPermissionLevel{},
+					},
+				},
+				Members: []string{"george"},
+				Admins:  []string{"admin"},
+				Repos:   map[string]org.Repo{},
+			},
+		},
 	}
 
 	for _, tc := range cases {
@@ -2308,15 +2386,16 @@ func TestDumpOrgConfig(t *testing.T) {
 				orgName = tc.orgOverride
 			}
 			fc := fakeDumpClient{
-				name:            orgName,
-				members:         tc.members,
-				admins:          tc.admins,
-				meta:            tc.meta,
-				teams:           tc.teams,
-				teamMembers:     tc.teamMembers,
-				maintainers:     tc.maintainers,
-				repoPermissions: tc.repoPermissions,
-				repos:           tc.repos,
+				name:              orgName,
+				members:           tc.members,
+				admins:            tc.admins,
+				meta:              tc.meta,
+				teams:             tc.teams,
+				teamMembers:       tc.teamMembers,
+				maintainers:       tc.maintainers,
+				enterpriseMembers: tc.enterpriseMembers,
+				repoPermissions:   tc.repoPermissions,
+				repos:             tc.repos,
 			}
 			actual, err := dumpOrgConfig(fc, orgName, tc.ignoreSecretTeams, tc.ignoreEnterpriseTeams, "")
 			switch {
@@ -2339,15 +2418,16 @@ func TestDumpOrgConfig(t *testing.T) {
 }
 
 type fakeDumpClient struct {
-	name            string
-	members         []string
-	admins          []string
-	meta            github.Organization
-	teams           []github.Team
-	teamMembers     map[string][]string
-	maintainers     map[string][]string
-	repoPermissions map[string][]github.Repo
-	repos           []github.FullRepo
+	name              string
+	members           []string
+	admins            []string
+	meta              github.Organization
+	teams             []github.Team
+	teamMembers       map[string][]string
+	maintainers       map[string][]string
+	enterpriseMembers map[string][]string
+	repoPermissions   map[string][]github.Repo
+	repos             []github.FullRepo
 }
 
 func (c fakeDumpClient) GetOrg(name string) (*github.Organization, error) {
@@ -2405,6 +2485,9 @@ func (c fakeDumpClient) ListTeamMembersBySlug(org, teamSlug, role string) ([]git
 		mapping = c.maintainers
 	case role == github.RoleMember:
 		mapping = c.teamMembers
+	case role == github.RoleAll:
+		// Used to enumerate enterprise-team members for exclusion; absent means empty.
+		return c.makeMembers(c.enterpriseMembers[teamSlug])
 	default:
 		return nil, fmt.Errorf("bad role: %s", role)
 	}

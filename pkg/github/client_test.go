@@ -3316,6 +3316,8 @@ func TestAllMethodsThatDoRequestSetOrgHeader(t *testing.T) {
 		"AcceptUserRepoInvitation",
 		// Bound to user, not org specific
 		"ListCurrentUserOrgInvitations",
+		// Bound to a user (/users/{login}), not org specific
+		"GetUser",
 	)
 
 	clientMethods := getCallForAllClientMethodsThroughReflection(
@@ -3893,7 +3895,6 @@ func TestCollaboratorMethodsDryRun(t *testing.T) {
 	}
 }
 
-
 func TestGetPendingApprovalActionRuns(t *testing.T) {
 	const (
 		org     = "k8s"
@@ -4459,5 +4460,135 @@ func TestAllowInDryRunOnlyForTokenAcquisition(t *testing.T) {
 			// (This part doesn't actually make the call, just documents the constraint)
 			t.Logf("IMPORTANT: %s must NOT use allowInDryRun=true because: %s", tc.name, tc.reason)
 		})
+	}
+}
+
+func TestListRepoRulesets(t *testing.T) {
+	expected := []Ruleset{
+		{ID: 1, Name: "peribolos/policy", Enforcement: "active"},
+		{ID: 2, Name: "peribolos/checks", Enforcement: "evaluate"},
+	}
+	ts := simpleTestServer(t, "/repos/org/repo/rulesets", expected, http.StatusOK)
+	defer ts.Close()
+	c := getClient(ts.URL)
+	got, err := c.ListRepoRulesets("org", "repo")
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	if !reflect.DeepEqual(got, expected) {
+		t.Errorf("Wrong rulesets, got %+v, want %+v", got, expected)
+	}
+}
+
+func TestGetRepoRuleset(t *testing.T) {
+	expected := Ruleset{ID: 42, Name: "peribolos/policy", Enforcement: "active", Target: "branch"}
+	ts := simpleTestServer(t, "/repos/org/repo/rulesets/42", expected, http.StatusOK)
+	defer ts.Close()
+	c := getClient(ts.URL)
+	got, err := c.GetRepoRuleset("org", "repo", 42)
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	if got == nil || !reflect.DeepEqual(*got, expected) {
+		t.Errorf("Wrong ruleset, got %+v, want %+v", got, expected)
+	}
+}
+
+func TestCreateRepoRuleset(t *testing.T) {
+	ts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Errorf("Bad method: %s", r.Method)
+		}
+		if r.URL.Path != "/repos/org/repo/rulesets" {
+			t.Errorf("Bad request path: %s", r.URL.Path)
+		}
+		b, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("Could not read request body: %v", err)
+		}
+		// An empty-but-non-nil bypass list must serialize as [] so updates can
+		// clear actors; verify the wire format explicitly.
+		if !strings.Contains(string(b), `"bypass_actors":[]`) {
+			t.Errorf("Expected bypass_actors to serialize as [], body: %s", string(b))
+		}
+		var req RulesetRequest
+		if err := json.Unmarshal(b, &req); err != nil {
+			t.Errorf("Could not unmarshal request: %v", err)
+		}
+		if req.Name != "peribolos/policy" {
+			t.Errorf("Bad name: %s", req.Name)
+		}
+		w.WriteHeader(http.StatusCreated)
+		fmt.Fprint(w, `{"id":7,"name":"peribolos/policy","enforcement":"active"}`)
+	}))
+	defer ts.Close()
+	c := getClient(ts.URL)
+	got, err := c.CreateRepoRuleset("org", "repo", RulesetRequest{
+		Name:         "peribolos/policy",
+		Enforcement:  "active",
+		BypassActors: []RulesetBypassActor{},
+	})
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	if got.ID != 7 {
+		t.Errorf("Expected created ruleset ID 7, got %d", got.ID)
+	}
+}
+
+func TestUpdateRepoRuleset(t *testing.T) {
+	ts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPut {
+			t.Errorf("Bad method: %s", r.Method)
+		}
+		if r.URL.Path != "/repos/org/repo/rulesets/9" {
+			t.Errorf("Bad request path: %s", r.URL.Path)
+		}
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, `{"id":9,"name":"peribolos/policy","enforcement":"evaluate"}`)
+	}))
+	defer ts.Close()
+	c := getClient(ts.URL)
+	got, err := c.UpdateRepoRuleset("org", "repo", 9, RulesetRequest{
+		Name:         "peribolos/policy",
+		Enforcement:  "evaluate",
+		BypassActors: []RulesetBypassActor{},
+	})
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	if got.ID != 9 || got.Enforcement != "evaluate" {
+		t.Errorf("Wrong updated ruleset: %+v", got)
+	}
+}
+
+func TestDeleteRepoRuleset(t *testing.T) {
+	ts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodDelete {
+			t.Errorf("Bad method: %s", r.Method)
+		}
+		if r.URL.Path != "/repos/org/repo/rulesets/5" {
+			t.Errorf("Bad request path: %s", r.URL.Path)
+		}
+		http.Error(w, "204 No Content", http.StatusNoContent)
+	}))
+	defer ts.Close()
+	c := getClient(ts.URL)
+	if err := c.DeleteRepoRuleset("org", "repo", 5); err != nil {
+		t.Errorf("Unexpected error: %v", err)
+	}
+}
+
+func TestGetUser(t *testing.T) {
+	expected := User{Login: "octocat", ID: 583231}
+	ts := simpleTestServer(t, "/users/octocat", expected, http.StatusOK)
+	defer ts.Close()
+	c := getClient(ts.URL)
+	got, err := c.GetUser("octocat")
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	if got == nil || got.Login != "octocat" || got.ID != 583231 {
+		t.Errorf("Wrong user, got %+v, want %+v", got, expected)
 	}
 }

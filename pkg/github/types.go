@@ -1768,19 +1768,19 @@ type Layers struct {
 // Ruleset represents a GitHub repository or organization ruleset.
 // See https://docs.github.com/en/rest/repos/rules
 type Ruleset struct {
-	ID                   int                 `json:"id"`
-	Name                 string              `json:"name"`
-	Target               string              `json:"target,omitempty"`
-	Enforcement          string              `json:"enforcement"`
-	SourceType           string              `json:"source_type,omitempty"`
-	Source               string              `json:"source,omitempty"`
-	NodeID               string              `json:"node_id,omitempty"`
+	ID                   int                  `json:"id"`
+	Name                 string               `json:"name"`
+	Target               string               `json:"target,omitempty"`
+	Enforcement          string               `json:"enforcement"`
+	SourceType           string               `json:"source_type,omitempty"`
+	Source               string               `json:"source,omitempty"`
+	NodeID               string               `json:"node_id,omitempty"`
 	BypassActors         []RulesetBypassActor `json:"bypass_actors,omitempty"`
 	Conditions           *RulesetConditions   `json:"conditions,omitempty"`
 	Rules                []RulesetRule        `json:"rules,omitempty"`
-	CurrentUserCanBypass string              `json:"current_user_can_bypass,omitempty"`
-	CreatedAt            string              `json:"created_at,omitempty"`
-	UpdatedAt            string              `json:"updated_at,omitempty"`
+	CurrentUserCanBypass string               `json:"current_user_can_bypass,omitempty"`
+	CreatedAt            string               `json:"created_at,omitempty"`
+	UpdatedAt            string               `json:"updated_at,omitempty"`
 }
 
 // RulesetBypassActor specifies an actor that can bypass ruleset rules.
@@ -1831,11 +1831,11 @@ type RulesetStatusCheck struct {
 
 // RulesetPullRequestParams holds parameters for the pull_request rule type.
 type RulesetPullRequestParams struct {
-	DismissStaleReviewsOnPush      bool                        `json:"dismiss_stale_reviews_on_push"`
-	RequireCodeOwnerReview         bool                        `json:"require_code_owner_review"`
-	RequireLastPushApproval        bool                        `json:"require_last_push_approval"`
-	RequiredApprovingReviewCount   int                         `json:"required_approving_review_count"`
-	RequiredReviewThreadResolution bool                        `json:"required_review_thread_resolution"`
+	DismissStaleReviewsOnPush      bool                         `json:"dismiss_stale_reviews_on_push"`
+	RequireCodeOwnerReview         bool                         `json:"require_code_owner_review"`
+	RequireLastPushApproval        bool                         `json:"require_last_push_approval"`
+	RequiredApprovingReviewCount   int                          `json:"required_approving_review_count"`
+	RequiredReviewThreadResolution bool                         `json:"required_review_thread_resolution"`
 	DismissalRestriction           *RulesetDismissalRestriction `json:"dismissal_restriction,omitempty"`
 }
 
@@ -1854,9 +1854,9 @@ type RulesetDismissalActor struct {
 // RulesetRequest is the body for creating or updating a ruleset.
 // All fields are optional on update (partial update).
 type RulesetRequest struct {
-	Name         string               `json:"name,omitempty"`
-	Target       string               `json:"target,omitempty"`
-	Enforcement  string               `json:"enforcement,omitempty"`
+	Name        string `json:"name,omitempty"`
+	Target      string `json:"target,omitempty"`
+	Enforcement string `json:"enforcement,omitempty"`
 	// BypassActors is intentionally not omitempty: an empty slice must be sent as
 	// [] so an update that removes all bypass actors (e.g. expired bootstrap access)
 	// actually clears them instead of being omitted and leaving the old list.
