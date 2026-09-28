@@ -883,7 +883,7 @@ func TestConfigureOrgMembers(t *testing.T) {
 				failedInvites:      tc.failedInvites,
 			}
 
-			err := configureOrgMembers(tc.opt, fc, fakeOrg, tc.config, sets.New[string](tc.invitations...), tc.failedInvites)
+			err := configureOrgMembers(tc.opt, fc, fakeOrg, tc.config, sets.New[string](tc.invitations...), tc.failedInvites, nil)
 			switch {
 			case err != nil:
 				if !tc.err {
@@ -1318,7 +1318,7 @@ func TestConfigureTeams(t *testing.T) {
 			if tc.delta == 0 {
 				tc.delta = 1
 			}
-			actual, err := configureTeams(fc, orgName, tc.config, tc.delta, tc.ignoreSecretTeams, tc.ignoreEnterpriseTeams)
+			actual, err := configureTeams(fc, orgName, tc.config, tc.delta, tc.ignoreSecretTeams, tc.ignoreEnterpriseTeams, nil)
 			switch {
 			case err != nil:
 				if !tc.err {
@@ -1509,7 +1509,7 @@ func TestConfigureTeam(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			fc := makeFakeTeamClient(tc.github)
-			err := configureTeam(fc, fakeOrg, tc.teamName, tc.config, tc.github, tc.parent)
+			err := configureTeam(fc, fakeOrg, tc.teamName, tc.config, tc.github, tc.parent, nil)
 			switch {
 			case err != nil:
 				if !tc.err {
@@ -1618,7 +1618,7 @@ func TestConfigureTeamMembers(t *testing.T) {
 				newAdmins:  sets.Set[string]{},
 				newMembers: sets.Set[string]{},
 			}
-			err := configureTeamMembers(fc, "", gt, tc.team, tc.ignoreInvitees)
+			err := configureTeamMembers(fc, "", gt, tc.team, tc.ignoreInvitees, nil)
 			switch {
 			case err != nil:
 				if !tc.err {
@@ -1964,7 +1964,7 @@ func TestConfigureOrgMeta(t *testing.T) {
 			fc := fakeOrgClient{
 				current: tc.have,
 			}
-			err := configureOrgMeta(&fc, tc.orgName, tc.want)
+			err := configureOrgMeta(&fc, tc.orgName, tc.want, nil)
 			switch {
 			case err != nil:
 				if !tc.err {
@@ -2947,7 +2947,7 @@ func TestDumpConfigRoundTripsEnterpriseMemberOnRegularTeam(t *testing.T) {
 		enterpriseTeams: map[string][]github.TeamMember{"ent-security": {{Login: "ent-direct"}}},
 	}
 	opt := options{ignoreEnterpriseTeams: true, maximumDelta: 1, minAdmins: 1}
-	if err := configureOrgMembers(opt, applyFake, orgName, *dumped, sets.Set[string]{}, nil); err != nil {
+	if err := configureOrgMembers(opt, applyFake, orgName, *dumped, sets.Set[string]{}, nil, nil); err != nil {
 		t.Fatalf("re-applying the dumped config failed (round-trip broken): %v", err)
 	}
 
@@ -3559,7 +3559,7 @@ func TestConfigureTeamRepos(t *testing.T) {
 			failUpdate: testCase.failUpdate,
 			failRemove: testCase.failRemove,
 		}
-		err := configureTeamRepos(&client, testCase.githubTeams, testCase.teamName, "org", testCase.team)
+		err := configureTeamRepos(&client, testCase.githubTeams, testCase.teamName, "org", testCase.team, nil)
 		if err == nil && testCase.expectedErr {
 			t.Errorf("%s: expected an error but got none", testCase.name)
 		}
@@ -4023,9 +4023,9 @@ func TestConfigureRepos(t *testing.T) {
 			fc := makeFakeRepoClient(t, tc.repos...)
 			var err error
 			if len(tc.orgNameOverride) > 0 {
-				err = configureRepos(tc.opts, fc, tc.orgNameOverride, tc.orgConfig)
+				err = configureRepos(tc.opts, fc, tc.orgNameOverride, tc.orgConfig, nil)
 			} else {
-				err = configureRepos(tc.opts, fc, orgName, tc.orgConfig)
+				err = configureRepos(tc.opts, fc, orgName, tc.orgConfig, nil)
 			}
 			if err != nil && !tc.expectError {
 				t.Errorf("%s: unexpected error: %v", tc.description, err)
@@ -4417,7 +4417,7 @@ func TestConfigureCollaborators(t *testing.T) {
 			// Set up existing collaborators
 			maps.Copy(client.collaborators, tc.existingCollaborators)
 
-			err := configureCollaborators(client, "test-org", "test-repo", tc.repo)
+			err := configureCollaborators(client, "test-org", "test-repo", tc.repo, nil)
 
 			if tc.expectedErr && err == nil {
 				t.Errorf("Expected error but got none")
@@ -4572,7 +4572,7 @@ func TestConfigureCollaboratorsRemovePendingInvitations(t *testing.T) {
 		// Note: "remove-pending" is NOT in the config, so their invitation should be removed
 	}
 
-	err := configureCollaborators(client, "test-org", "test-repo", repo)
+	err := configureCollaborators(client, "test-org", "test-repo", repo, nil)
 	if err != nil {
 		t.Errorf("unexpected error: %v", err)
 	}
@@ -4649,7 +4649,7 @@ func TestConfigureCollaboratorsInvitationManagement(t *testing.T) {
 		},
 	}
 
-	err := configureCollaborators(client, "test-org", "test-repo", repo)
+	err := configureCollaborators(client, "test-org", "test-repo", repo, nil)
 	if err != nil {
 		t.Errorf("unexpected error: %v", err)
 	}
@@ -4712,7 +4712,7 @@ func TestConfigureCollaboratorsInvitationPermissionChecking(t *testing.T) {
 		},
 	}
 
-	err := configureCollaborators(client, "test-org", "test-repo", repo)
+	err := configureCollaborators(client, "test-org", "test-repo", repo, nil)
 	if err != nil {
 		t.Errorf("unexpected error: %v", err)
 	}
@@ -4834,7 +4834,7 @@ func TestConfigureCollaboratorsLargeSet(t *testing.T) {
 	}
 
 	repo := org.Repo{Collaborators: desired}
-	if err := configureCollaborators(client, "org", "repo", repo); err != nil {
+	if err := configureCollaborators(client, "org", "repo", repo, nil); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
@@ -4878,7 +4878,7 @@ func TestConfigureCollaboratorsCorrectAPIEndpoints(t *testing.T) {
 		},
 	}
 
-	err := configureCollaborators(client, "test-org", "test-repo", repo)
+	err := configureCollaborators(client, "test-org", "test-repo", repo, nil)
 	if err != nil {
 		t.Errorf("unexpected error: %v", err)
 	}
@@ -4931,7 +4931,7 @@ func TestConfigureCollaboratorsInvitationVsCollaboratorRemoval(t *testing.T) {
 		},
 	}
 
-	err := configureCollaborators(client, "test-org", "test-repo", repo)
+	err := configureCollaborators(client, "test-org", "test-repo", repo, nil)
 	if err != nil {
 		t.Errorf("unexpected error: %v", err)
 	}
@@ -4966,7 +4966,7 @@ func TestConfigureCollaborators_Idempotent_NoChangeForDirectCollaborator(t *test
 		},
 	}
 
-	err := configureCollaborators(client, "test-org", "test-repo", repo)
+	err := configureCollaborators(client, "test-org", "test-repo", repo, nil)
 	if err != nil {
 		t.Errorf("unexpected error: %v", err)
 	}
@@ -4997,7 +4997,7 @@ func TestConfigureCollaborators_PermissionMatrix_TransitionsExistingCollaborator
 
 				repo := org.Repo{Collaborators: map[string]github.RepoPermissionLevel{"user": to}}
 
-				err := configureCollaborators(client, "org", "repo", repo)
+				err := configureCollaborators(client, "org", "repo", repo, nil)
 				if err != nil {
 					t.Fatalf("unexpected error: %v", err)
 				}
@@ -5039,7 +5039,7 @@ func TestConfigureCollaborators_PermissionMatrix_PendingInvitationUpdates(t *tes
 
 				repo := org.Repo{Collaborators: map[string]github.RepoPermissionLevel{"user": to}}
 
-				err := configureCollaborators(client, "org", "repo", repo)
+				err := configureCollaborators(client, "org", "repo", repo, nil)
 				if err != nil {
 					t.Fatalf("unexpected error: %v", err)
 				}

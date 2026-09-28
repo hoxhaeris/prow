@@ -64,6 +64,7 @@ type options struct {
 	ignoreEnterpriseTeams bool
 	allowRepoArchival     bool
 	allowRepoPublish      bool
+	reportPath            string
 	github                flagutil.GitHubOptions
 
 	logLevel string
@@ -99,6 +100,7 @@ func (o *options) parseArgs(flags *flag.FlagSet, args []string) error {
 	flags.BoolVar(&o.fixCollaborators, "fix-collaborators", false, "Add/remove/update repository collaborators if set")
 	flags.BoolVar(&o.allowRepoArchival, "allow-repo-archival", false, "If set, archiving repos is allowed while updating repos")
 	flags.BoolVar(&o.allowRepoPublish, "allow-repo-publish", false, "If set, changing repository visibility to public is allowed while updating repos")
+	flags.StringVar(&o.reportPath, "report-path", "", "If set, write a machine-readable JSON report of all changes to this file")
 	flags.StringVar(&o.logLevel, "log-level", logrus.InfoLevel.String(), fmt.Sprintf("Logging level, one of %v", logrus.AllLevels))
 	o.github.AddCustomizedFlags(flags, flagutil.ThrottlerDefaults(defaultTokens, defaultBurst))
 	if err := flags.Parse(args); err != nil {
@@ -195,12 +197,46 @@ func main() {
 		logrus.WithError(err).Fatal("Failed to load configuration")
 	}
 
+	report := newChangeReport(!o.confirm)
 	for name, orgcfg := range cfg.Orgs {
-		if err := configureOrg(o, githubClient, name, orgcfg); err != nil {
+		if err := configureOrg(o, githubClient, name, orgcfg, report); err != nil {
 			logrus.Fatalf("Configuration failed: %v", err)
 		}
 	}
 	logrus.Info("Finished syncing configuration.")
+
+	emitReport(o, report)
+}
+
+// emitReport writes the end-of-run change report: a one-line headline to the log
+// stream, the full human-readable summary to stdout, and, when --report-path is
+// set, the machine-readable JSON report to that file. It never fails the run: the
+// reconciliation has already completed by the time it is called.
+func emitReport(o options, report *changeReport) {
+	out := report.output()
+	logrus.WithFields(logrus.Fields{
+		"dryRun": out.DryRun,
+		"add":    out.Summary[actionAdd],
+		"update": out.Summary[actionUpdate],
+		"remove": out.Summary[actionRemove],
+	}).Info("Change report")
+
+	if err := report.writeHuman(os.Stdout); err != nil {
+		logrus.WithError(err).Error("Failed to write change report to stdout")
+	}
+
+	if o.reportPath == "" {
+		return
+	}
+	f, err := os.Create(o.reportPath)
+	if err != nil {
+		logrus.WithError(err).Errorf("Failed to create change report file %s", o.reportPath)
+		return
+	}
+	defer f.Close()
+	if err := report.writeJSON(f); err != nil {
+		logrus.WithError(err).Errorf("Failed to write change report to %s", o.reportPath)
+	}
 }
 
 type dumpClient interface {
@@ -518,7 +554,7 @@ func enterpriseTeamMembers(client enterpriseTeamMemberClient, orgName string, te
 	return enterpriseMembers, utilerrors.NewAggregate(errs)
 }
 
-func configureOrgMembers(opt options, client orgClient, orgName string, orgConfig org.Config, invitees sets.Set[string], failedInvites map[string][]int) error {
+func configureOrgMembers(opt options, client orgClient, orgName string, orgConfig org.Config, invitees sets.Set[string], failedInvites map[string][]int, report *changeReport) error {
 	// Get desired state
 	wantAdmins := sets.New[string](orgConfig.Admins...)
 	wantMembers := sets.New[string](orgConfig.Members...)
@@ -638,6 +674,7 @@ func configureOrgMembers(opt options, client orgClient, orgName string, orgConfi
 		if super {
 			role = github.RoleAdmin
 		}
+		report.recordMemberAdd(kindOrgMember, orgName, "", user, have, super)
 		om, err := client.UpdateOrgMembership(orgName, user, super)
 		if err != nil {
 			logrus.WithError(err).Warnf("UpdateOrgMembership(%s, %s, %t) failed", orgName, user, super)
@@ -655,6 +692,7 @@ func configureOrgMembers(opt options, client orgClient, orgName string, orgConfi
 	}
 
 	remover := func(user string) error {
+		report.recordMemberRemove(kindOrgMember, orgName, "", user, have)
 		err := client.RemoveOrgMembership(orgName, user)
 		if err != nil {
 			logrus.WithError(err).Warnf("RemoveOrgMembership(%s, %s) failed", orgName, user)
@@ -817,7 +855,7 @@ type teamClient interface {
 }
 
 // configureTeams returns the ids for all expected team names, creating/deleting teams as necessary.
-func configureTeams(client teamClient, orgName string, orgConfig org.Config, maxDelta float64, ignoreSecretTeams bool, ignoreEnterpriseTeams bool) (map[string]github.Team, error) {
+func configureTeams(client teamClient, orgName string, orgConfig org.Config, maxDelta float64, ignoreSecretTeams bool, ignoreEnterpriseTeams bool, report *changeReport) (map[string]github.Team, error) {
 	if err := validateTeamNames(orgConfig); err != nil {
 		return nil, err
 	}
@@ -909,6 +947,7 @@ func configureTeams(client teamClient, orgName string, orgConfig org.Config, max
 			failures = append(failures, name)
 			continue
 		}
+		report.record(change{Kind: kindTeam, Org: orgName, Target: name, Action: actionAdd})
 		matches[name] = *t
 		// t.Slug may include a slug already present in slugs if other actors are deleting teams.
 		used.Insert(t.Slug)
@@ -928,6 +967,7 @@ func configureTeams(client teamClient, orgName string, orgConfig org.Config, max
 	}
 	// Delete undeclared teams.
 	for slug := range unused {
+		report.record(change{Kind: kindTeam, Org: orgName, Target: teams[slug].Name, Action: actionRemove})
 		if err := client.DeleteTeamBySlug(orgName, slug); err != nil {
 			str := fmt.Sprintf("%s(%s)", slug, teams[slug].Name)
 			logrus.WithError(err).Warnf("Failed to delete team %s from %s", str, orgName)
@@ -976,29 +1016,37 @@ type orgMetadataClient interface {
 }
 
 // configureOrgMeta will update github to have the non-nil wanted metadata values.
-func configureOrgMeta(client orgMetadataClient, orgName string, want org.Metadata) error {
+func configureOrgMeta(client orgMetadataClient, orgName string, want org.Metadata, report *changeReport) error {
 	cur, err := client.GetOrg(orgName)
 	if err != nil {
 		return fmt.Errorf("failed to get %s metadata: %w", orgName, err)
 	}
-	change := false
-	change = updateString(&cur.BillingEmail, want.BillingEmail) || change
-	change = updateString(&cur.Company, want.Company) || change
-	change = updateString(&cur.Email, want.Email) || change
-	change = updateString(&cur.Name, want.Name) || change
-	change = updateString(&cur.Description, want.Description) || change
-	change = updateString(&cur.Location, want.Location) || change
+	// Track the names (not values) of changed fields: org metadata can contain
+	// personal data (e.g. billing email), which does not belong in the report.
+	var changed []string
+	track := func(name string, didChange bool) {
+		if didChange {
+			changed = append(changed, name)
+		}
+	}
+	track("billing_email", updateString(&cur.BillingEmail, want.BillingEmail))
+	track("company", updateString(&cur.Company, want.Company))
+	track("email", updateString(&cur.Email, want.Email))
+	track("name", updateString(&cur.Name, want.Name))
+	track("description", updateString(&cur.Description, want.Description))
+	track("location", updateString(&cur.Location, want.Location))
 	if want.DefaultRepositoryPermission != nil {
 		w := string(*want.DefaultRepositoryPermission)
-		change = updateString(&cur.DefaultRepositoryPermission, &w) || change
+		track("default_repository_permission", updateString(&cur.DefaultRepositoryPermission, &w))
 	}
-	change = updateBool(&cur.HasOrganizationProjects, want.HasOrganizationProjects) || change
-	change = updateBool(&cur.HasRepositoryProjects, want.HasRepositoryProjects) || change
-	change = updateBool(&cur.MembersCanCreateRepositories, want.MembersCanCreateRepositories) || change
-	if change {
+	track("has_organization_projects", updateBool(&cur.HasOrganizationProjects, want.HasOrganizationProjects))
+	track("has_repository_projects", updateBool(&cur.HasRepositoryProjects, want.HasRepositoryProjects))
+	track("members_can_create_repositories", updateBool(&cur.MembersCanCreateRepositories, want.MembersCanCreateRepositories))
+	if len(changed) > 0 {
 		if _, err := client.EditOrg(orgName, *cur); err != nil {
 			return fmt.Errorf("failed to edit %s metadata: %w", orgName, err)
 		}
+		report.record(change{Kind: kindOrgMeta, Org: orgName, Target: orgName, Action: actionUpdate, After: changed})
 	}
 	return nil
 }
@@ -1051,11 +1099,11 @@ func orgFailedInvitations(opt options, client failedInviteClient, orgName string
 	return result, nil
 }
 
-func configureOrg(opt options, client github.Client, orgName string, orgConfig org.Config) error {
+func configureOrg(opt options, client github.Client, orgName string, orgConfig org.Config, report *changeReport) error {
 	// Ensure that metadata is configured correctly.
 	if !opt.fixOrg {
 		logrus.Infof("Skipping org metadata configuration")
-	} else if err := configureOrgMeta(client, orgName, orgConfig.Metadata); err != nil {
+	} else if err := configureOrgMeta(client, orgName, orgConfig.Metadata, report); err != nil {
 		return err
 	}
 
@@ -1072,14 +1120,14 @@ func configureOrg(opt options, client github.Client, orgName string, orgConfig o
 	// Invite/remove/update members to the org.
 	if !opt.fixOrgMembers {
 		logrus.Infof("Skipping org member configuration")
-	} else if err := configureOrgMembers(opt, client, orgName, orgConfig, invitees, failedInvites); err != nil {
+	} else if err := configureOrgMembers(opt, client, orgName, orgConfig, invitees, failedInvites, report); err != nil {
 		return fmt.Errorf("failed to configure %s members: %w", orgName, err)
 	}
 
 	// Create repositories in the org
 	if !opt.fixRepos {
 		logrus.Info("Skipping org repositories configuration")
-	} else if err := configureRepos(opt, client, orgName, orgConfig); err != nil {
+	} else if err := configureRepos(opt, client, orgName, orgConfig, report); err != nil {
 		return fmt.Errorf("failed to configure %s repos: %w", orgName, err)
 	}
 
@@ -1088,7 +1136,7 @@ func configureOrg(opt options, client github.Client, orgName string, orgConfig o
 		logrus.Info("Skipping repository collaborators configuration")
 	} else {
 		for repoName, repo := range orgConfig.Repos {
-			if err := configureCollaborators(client, orgName, repoName, repo); err != nil {
+			if err := configureCollaborators(client, orgName, repoName, repo, report); err != nil {
 				return fmt.Errorf("failed to configure %s/%s collaborators: %w", orgName, repoName, err)
 			}
 		}
@@ -1100,13 +1148,13 @@ func configureOrg(opt options, client github.Client, orgName string, orgConfig o
 	}
 
 	// Find the id and current state of each declared team (create/delete as necessary)
-	githubTeams, err := configureTeams(client, orgName, orgConfig, opt.maximumDelta, opt.ignoreSecretTeams, opt.ignoreEnterpriseTeams)
+	githubTeams, err := configureTeams(client, orgName, orgConfig, opt.maximumDelta, opt.ignoreSecretTeams, opt.ignoreEnterpriseTeams, report)
 	if err != nil {
 		return fmt.Errorf("failed to configure %s teams: %w", orgName, err)
 	}
 
 	for name, team := range orgConfig.Teams {
-		err := configureTeamAndMembers(opt, client, githubTeams, name, orgName, team, nil)
+		err := configureTeamAndMembers(opt, client, githubTeams, name, orgName, team, nil, report)
 		if err != nil {
 			return fmt.Errorf("failed to configure %s teams: %w", orgName, err)
 		}
@@ -1115,7 +1163,7 @@ func configureOrg(opt options, client github.Client, orgName string, orgConfig o
 			logrus.Infof("Skipping team repo permissions configuration")
 			continue
 		}
-		if err := configureTeamRepos(client, githubTeams, name, orgName, team); err != nil {
+		if err := configureTeamRepos(client, githubTeams, name, orgName, team, report); err != nil {
 			return fmt.Errorf("failed to configure %s team %s repos: %w", orgName, name, err)
 		}
 	}
@@ -1216,6 +1264,56 @@ func newRepoUpdateRequest(current github.FullRepo, name string, repo org.Repo) g
 
 }
 
+// changedRepoFields returns the snake_case names of the fields set in a repo
+// update delta, for the change report. It intentionally reports field names, not
+// values.
+func changedRepoFields(delta github.RepoUpdateRequest) []string {
+	var f []string
+	if delta.Name != nil {
+		f = append(f, "name")
+	}
+	if delta.Description != nil {
+		f = append(f, "description")
+	}
+	if delta.Homepage != nil {
+		f = append(f, "homepage")
+	}
+	if delta.Visibility != nil {
+		f = append(f, "visibility")
+	}
+	if delta.HasIssues != nil {
+		f = append(f, "has_issues")
+	}
+	if delta.HasProjects != nil {
+		f = append(f, "has_projects")
+	}
+	if delta.HasWiki != nil {
+		f = append(f, "has_wiki")
+	}
+	if delta.AllowSquashMerge != nil {
+		f = append(f, "allow_squash_merge")
+	}
+	if delta.AllowMergeCommit != nil {
+		f = append(f, "allow_merge_commit")
+	}
+	if delta.AllowRebaseMerge != nil {
+		f = append(f, "allow_rebase_merge")
+	}
+	if delta.SquashMergeCommitTitle != nil {
+		f = append(f, "squash_merge_commit_title")
+	}
+	if delta.SquashMergeCommitMessage != nil {
+		f = append(f, "squash_merge_commit_message")
+	}
+	if delta.DefaultBranch != nil {
+		f = append(f, "default_branch")
+	}
+	if delta.Archived != nil {
+		f = append(f, "archived")
+	}
+	return f
+}
+
 func sanitizeRepoDelta(opt options, delta *github.RepoUpdateRequest) []error {
 	var errs []error
 	if delta.Archived != nil && !*delta.Archived {
@@ -1234,7 +1332,7 @@ func sanitizeRepoDelta(opt options, delta *github.RepoUpdateRequest) []error {
 	return errs
 }
 
-func configureRepos(opt options, client repoClient, orgName string, orgConfig org.Config) error {
+func configureRepos(opt options, client repoClient, orgName string, orgConfig org.Config, report *changeReport) error {
 	if err := validateRepos(orgConfig.Repos); err != nil {
 		return err
 	}
@@ -1288,6 +1386,7 @@ func configureRepos(opt options, client repoClient, orgName string, orgConfig or
 				repoLogger.WithError(err).Error("failed to create repository")
 				allErrors = append(allErrors, err)
 			} else {
+				report.record(change{Kind: kindRepo, Org: orgName, Target: wantName, Action: actionAdd})
 				existing = created
 			}
 		}
@@ -1309,6 +1408,7 @@ func configureRepos(opt options, client repoClient, orgName string, orgConfig or
 			}
 			if delta.Defined() {
 				repoLogger.Info("repo exists and differs from desired state, updating")
+				report.record(change{Kind: kindRepo, Org: orgName, Target: wantName, Action: actionUpdate, After: changedRepoFields(delta)})
 				if _, err := client.UpdateRepo(orgName, existing.Name, delta); err != nil {
 					repoLogger.WithError(err).Error("failed to update repository")
 					allErrors = append(allErrors, err)
@@ -1335,7 +1435,7 @@ type collaboratorClient interface {
 // configureCollaborators updates the list of repository collaborators when necessary
 // This function gets only direct collaborators (explicitly added) and manages them
 // according to the configuration. Org members with inherited access are not affected.
-func configureCollaborators(client collaboratorClient, orgName, repoName string, repo org.Repo) error {
+func configureCollaborators(client collaboratorClient, orgName, repoName string, repo org.Repo, report *changeReport) error {
 	want := repo.Collaborators
 	if want == nil {
 		want = map[string]github.RepoPermissionLevel{}
@@ -1396,11 +1496,14 @@ func configureCollaborators(client collaboratorClient, orgName, repoName string,
 		actions[wantUser] = wantPermission
 
 		// Determine the appropriate action and log message
-		if _, exists := currentCollaborators.collaborators[normalizedUser]; exists {
+		if currentInfo, exists := currentCollaborators.collaborators[normalizedUser]; exists {
+			report.record(change{Kind: kindCollaborator, Org: orgName, Scope: repoName, Target: wantUser, Action: actionUpdate, Before: currentInfo.permission, After: wantPermission})
 			logrus.Infof("Will update collaborator %s with %s permission", wantUser, wantPermission)
 		} else if pendingPermission, hasPendingInvitation := pendingInvitations[normalizedUser]; hasPendingInvitation {
+			report.record(change{Kind: kindCollaborator, Org: orgName, Scope: repoName, Target: wantUser, Action: actionUpdate, Before: pendingPermission, After: wantPermission})
 			logrus.Infof("Will update pending invitation for %s from %s to %s permission", wantUser, pendingPermission, wantPermission)
 		} else {
+			report.record(change{Kind: kindCollaborator, Org: orgName, Scope: repoName, Target: wantUser, Action: actionAdd, After: wantPermission})
 			logrus.Infof("Will add collaborator %s with %s permission", wantUser, wantPermission)
 		}
 	}
@@ -1412,6 +1515,7 @@ func configureCollaborators(client collaboratorClient, orgName, repoName string,
 		if _, exists := wantedCollaborators.collaborators[normalizedCurrentUser]; !exists {
 			originalName := combinedCollaborators.originalName(normalizedCurrentUser)
 			actions[originalName] = github.None
+			report.record(change{Kind: kindCollaborator, Org: orgName, Scope: repoName, Target: originalName, Action: actionRemove, Before: combinedCollaborators.collaborators[normalizedCurrentUser].permission})
 
 			// Check if this is a pending invitation
 			if _, isPending := pendingInvitations[normalizedCurrentUser]; isPending {
@@ -1477,14 +1581,14 @@ func configureCollaborators(client collaboratorClient, orgName, repoName string,
 	return utilerrors.NewAggregate(updateErrors)
 }
 
-func configureTeamAndMembers(opt options, client github.Client, githubTeams map[string]github.Team, name, orgName string, team org.Team, parent *int) error {
+func configureTeamAndMembers(opt options, client github.Client, githubTeams map[string]github.Team, name, orgName string, team org.Team, parent *int, report *changeReport) error {
 	gt, ok := githubTeams[name]
 	if !ok { // configureTeams is buggy if this is the case
 		return fmt.Errorf("%s not found in id list", name)
 	}
 
 	// Configure team metadata
-	err := configureTeam(client, orgName, name, team, gt, parent)
+	err := configureTeam(client, orgName, name, team, gt, parent, report)
 	if err != nil {
 		return fmt.Errorf("failed to update %s metadata: %w", name, err)
 	}
@@ -1492,7 +1596,7 @@ func configureTeamAndMembers(opt options, client github.Client, githubTeams map[
 	// Configure team members
 	if !opt.fixTeamMembers {
 		logrus.Infof("Skipping %s member configuration", name)
-	} else if err = configureTeamMembers(client, orgName, gt, team, opt.ignoreInvitees); err != nil {
+	} else if err = configureTeamMembers(client, orgName, gt, team, opt.ignoreInvitees, report); err != nil {
 		if opt.confirm {
 			return fmt.Errorf("failed to update %s members: %w", name, err)
 		}
@@ -1501,7 +1605,7 @@ func configureTeamAndMembers(opt options, client github.Client, githubTeams map[
 	}
 
 	for childName, childTeam := range team.Children {
-		err = configureTeamAndMembers(opt, client, githubTeams, childName, orgName, childTeam, &gt.ID)
+		err = configureTeamAndMembers(opt, client, githubTeams, childName, orgName, childTeam, &gt.ID, report)
 		if err != nil {
 			return fmt.Errorf("failed to update %s child teams: %w", name, err)
 		}
@@ -1515,49 +1619,51 @@ type editTeamClient interface {
 }
 
 // configureTeam patches the team name/description/privacy when values differ
-func configureTeam(client editTeamClient, orgName, teamName string, team org.Team, gt github.Team, parent *int) error {
-	// Do we need to reconfigure any team settings?
-	var patch bool
+func configureTeam(client editTeamClient, orgName, teamName string, team org.Team, gt github.Team, parent *int, report *changeReport) error {
+	// Do we need to reconfigure any team settings? Track the names of the fields
+	// that differ so the change report can describe the update.
+	var changed []string
 	if gt.Name != teamName {
-		patch = true
+		changed = append(changed, "name")
 	}
 	gt.Name = teamName
 	if team.Description != nil && gt.Description != *team.Description {
-		patch = true
+		changed = append(changed, "description")
 		gt.Description = *team.Description
 	} else {
 		gt.Description = ""
 	}
 	// doesn't have parent in github, but has parent in config
 	if gt.Parent == nil && parent != nil {
-		patch = true
+		changed = append(changed, "parent")
 		gt.ParentTeamID = parent
 	}
 	if gt.Parent != nil { // has parent in github ...
 		if parent == nil { // ... but doesn't need one
-			patch = true
+			changed = append(changed, "parent")
 			gt.Parent = nil
 			gt.ParentTeamID = parent
 		} else if gt.Parent.ID != *parent { // but it's different than the config
-			patch = true
+			changed = append(changed, "parent")
 			gt.Parent = nil
 			gt.ParentTeamID = parent
 		}
 	}
 
 	if team.Privacy != nil && gt.Privacy != string(*team.Privacy) {
-		patch = true
+		changed = append(changed, "privacy")
 		gt.Privacy = string(*team.Privacy)
 
 	} else if team.Privacy == nil && (parent != nil || len(team.Children) > 0) && gt.Privacy != "closed" {
-		patch = true
+		changed = append(changed, "privacy")
 		gt.Privacy = github.PrivacyClosed // nested teams must be closed
 	}
 
-	if patch { // yes we need to patch
+	if len(changed) > 0 { // yes we need to patch
 		if _, err := client.EditTeam(orgName, gt); err != nil {
 			return fmt.Errorf("failed to edit %s team %s(%s): %w", orgName, gt.Slug, gt.Name, err)
 		}
+		report.record(change{Kind: kindTeam, Org: orgName, Target: teamName, Action: actionUpdate, After: changed})
 	}
 	return nil
 }
@@ -1569,7 +1675,7 @@ type teamRepoClient interface {
 }
 
 // configureTeamRepos updates the list of repos that the team has permissions for when necessary
-func configureTeamRepos(client teamRepoClient, githubTeams map[string]github.Team, name, orgName string, team org.Team) error {
+func configureTeamRepos(client teamRepoClient, githubTeams map[string]github.Team, name, orgName string, team org.Team, report *changeReport) error {
 	gt, ok := githubTeams[name]
 	if !ok { // configureTeams is buggy if this is the case
 		return fmt.Errorf("%s not found in id list", name)
@@ -1593,12 +1699,18 @@ func configureTeamRepos(client teamRepoClient, githubTeams map[string]github.Tea
 		}
 		// create or update this permission
 		actions[wantRepo] = wantPermission
+		if havePermission, haveRepo := have[wantRepo]; haveRepo {
+			report.record(change{Kind: kindTeamRepo, Org: orgName, Scope: name, Target: wantRepo, Action: actionUpdate, Before: havePermission, After: wantPermission})
+		} else {
+			report.record(change{Kind: kindTeamRepo, Org: orgName, Scope: name, Target: wantRepo, Action: actionAdd, After: wantPermission})
+		}
 	}
 
-	for haveRepo := range have {
+	for haveRepo, havePermission := range have {
 		if _, wantRepo := want[haveRepo]; !wantRepo {
 			// should remove these permissions
 			actions[haveRepo] = github.None
+			report.record(change{Kind: kindTeamRepo, Org: orgName, Scope: name, Target: haveRepo, Action: actionRemove, Before: havePermission})
 		}
 	}
 
@@ -1626,7 +1738,7 @@ func configureTeamRepos(client teamRepoClient, githubTeams map[string]github.Tea
 	}
 
 	for childName, childTeam := range team.Children {
-		if err := configureTeamRepos(client, githubTeams, childName, orgName, childTeam); err != nil {
+		if err := configureTeamRepos(client, githubTeams, childName, orgName, childTeam, report); err != nil {
 			updateErrors = append(updateErrors, fmt.Errorf("failed to configure %s child team %s repos: %w", orgName, childName, err))
 		}
 	}
@@ -1658,7 +1770,7 @@ func teamInvitations(client teamMembersClient, orgName, teamSlug string) (sets.S
 }
 
 // configureTeamMembers will add/update people to the appropriate role on the team, and remove anyone else.
-func configureTeamMembers(client teamMembersClient, orgName string, gt github.Team, team org.Team, ignoreInvitees bool) error {
+func configureTeamMembers(client teamMembersClient, orgName string, gt github.Team, team org.Team, ignoreInvitees bool, report *changeReport) error {
 	// Get desired state
 	wantMaintainers := sets.New[string](team.Maintainers...)
 	wantMembers := sets.New[string](team.Members...)
@@ -1691,6 +1803,11 @@ func configureTeamMembers(client teamMembersClient, orgName string, gt github.Te
 		}
 	}
 
+	// Normalized current membership, for classifying report changes as add vs
+	// update: the raw have* sets above are keyed by GitHub's casing, while the
+	// user passed to the closures below is normalized by configureMembers.
+	haveNorm := memberships{members: normalize(haveMembers), super: normalize(haveMaintainers)}
+
 	adder := func(user string, super bool) error {
 		if invitees.Has(user) {
 			logrus.Infof("Waiting for %s to accept invitation to %s(%s)", user, gt.Slug, gt.Name)
@@ -1700,6 +1817,7 @@ func configureTeamMembers(client teamMembersClient, orgName string, gt github.Te
 		if super {
 			role = github.RoleMaintainer
 		}
+		report.recordMemberAdd(kindTeamMember, orgName, gt.Slug, user, haveNorm, super)
 		tm, err := client.UpdateTeamMembershipBySlug(orgName, gt.Slug, user, super)
 		if err != nil {
 			// Augment the error with the operation we attempted so that the error makes sense after return
@@ -1714,6 +1832,7 @@ func configureTeamMembers(client teamMembersClient, orgName string, gt github.Te
 	}
 
 	remover := func(user string) error {
+		report.recordMemberRemove(kindTeamMember, orgName, gt.Slug, user, haveNorm)
 		err := client.RemoveTeamMembershipBySlug(orgName, gt.Slug, user)
 		if err != nil {
 			// Augment the error with the operation we attempted so that the error makes sense after return
