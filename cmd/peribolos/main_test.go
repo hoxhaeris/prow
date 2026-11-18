@@ -4275,18 +4275,16 @@ func (f fakeRepoClient) UpdateRepo(owner, name string, want github.RepoUpdateReq
 	if name == "fail" {
 		return nil, fmt.Errorf("injected UpdateRepo failure")
 	}
-	if want.Archived != nil && !*want.Archived {
-		f.t.Errorf("UpdateRepo() called to unarchive a repo (not supported by API)")
-		return nil, fmt.Errorf("UpdateRepo() called to unarchive a repo (not supported by API)")
-	}
-
 	have, exists := f.repos[name]
 	if !exists {
 		f.t.Errorf("UpdateRepo() called on repo that does not exists")
 		return nil, fmt.Errorf("UpdateRepo() called on repo that does not exist")
 	}
 
-	if have.Archived {
+	// Archived repos are read-only, with a single exception: a request that sets
+	// archived:false unarchives the repo, and GitHub applies any other fields in
+	// that same request too. Any update that leaves the repo archived is rejected.
+	if have.Archived && (want.Archived == nil || *want.Archived) {
 		return nil, fmt.Errorf("Repository was archived so is read-only.")
 	}
 
@@ -4456,25 +4454,48 @@ func TestConfigureRepos(t *testing.T) {
 			expectedRepos: []github.Repo{failRepo},
 		},
 		{
-			// https://developer.github.com/v3/repos/#edit
-			// "Note: You cannot unarchive repositories through the API."
-			// Archived repositories are read-only, and updates fail with 403:
-			// "Repository was archived so is read-only."
-			description: "request to unarchive a repo fails, repo is read-only",
+			description: "request to unarchive a repo is skipped (warn, not fatal) when not allowed",
 			orgConfig: org.Config{
 				Repos: map[string]org.Repo{
 					oldName: {Archived: &no, Description: &updated},
 				},
 			},
 			repos:         []github.FullRepo{{Repo: github.Repo{Name: oldName, Archived: true, Description: "OLD"}}},
-			expectError:   true,
+			expectError:   false,
 			expectedRepos: []github.Repo{{Name: oldName, Archived: true, Description: "OLD"}},
 		},
 		{
-			// https://developer.github.com/v3/repos/#edit
-			// "Note: You cannot unarchive repositories through the API."
-			// Archived repositories are read-only, and updates fail with 403:
-			// "Repository was archived so is read-only."
+			description: "request to unarchive a repo succeeds when allowed",
+			opts: options{
+				allowRepoUnarchival: true,
+			},
+			orgConfig: org.Config{
+				Repos: map[string]org.Repo{
+					oldName: {Archived: &no},
+				},
+			},
+			repos:         []github.FullRepo{{Repo: github.Repo{Name: oldName, Archived: true}}},
+			expectError:   false,
+			expectedRepos: []github.Repo{{Name: oldName, Archived: false}},
+		},
+		{
+			description: "unarchival and other field changes are applied in a single request",
+			opts: options{
+				allowRepoUnarchival: true,
+			},
+			orgConfig: org.Config{
+				Repos: map[string]org.Repo{
+					oldName: {Archived: &no, Description: &updated},
+				},
+			},
+			repos:         []github.FullRepo{{Repo: github.Repo{Name: oldName, Archived: true, Description: "OLD"}}},
+			expectError:   false,
+			expectedRepos: []github.Repo{{Name: oldName, Archived: false, Description: updated}},
+		},
+		{
+			// An archived repo that stays archived is left untouched: its other
+			// fields are read-only in GitHub, so the description drift is skipped
+			// rather than attempted (which would fail with a 403).
 			description: "no field changes on archived repo",
 			orgConfig: org.Config{
 				Repos: map[string]org.Repo{

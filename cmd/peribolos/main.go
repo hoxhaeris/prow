@@ -64,6 +64,7 @@ type options struct {
 	ignoreSecretTeams     bool
 	ignoreEnterpriseTeams bool
 	allowRepoArchival     bool
+	allowRepoUnarchival   bool
 	allowRepoPublish      bool
 	github                flagutil.GitHubOptions
 
@@ -100,6 +101,7 @@ func (o *options) parseArgs(flags *flag.FlagSet, args []string) error {
 	flags.BoolVar(&o.fixCollaborators, "fix-collaborators", false, "Add/remove/update repository collaborators if set")
 	flags.BoolVar(&o.fixOrgRoles, "fix-org-roles", false, "Assign/remove organization roles to teams and users if set")
 	flags.BoolVar(&o.allowRepoArchival, "allow-repo-archival", false, "If set, archiving repos is allowed while updating repos")
+	flags.BoolVar(&o.allowRepoUnarchival, "allow-repo-unarchival", false, "If set, unarchiving repos is allowed while updating repos")
 	flags.BoolVar(&o.allowRepoPublish, "allow-repo-publish", false, "If set, changing repository visibility to public is allowed while updating repos")
 	flags.StringVar(&o.logLevel, "log-level", logrus.InfoLevel.String(), fmt.Sprintf("Logging level, one of %v", logrus.AllLevels))
 	o.github.AddCustomizedFlags(flags, flagutil.ThrottlerDefaults(defaultTokens, defaultBurst))
@@ -1361,10 +1363,10 @@ func newRepoUpdateRequest(current github.FullRepo, name string, repo org.Repo) g
 
 func sanitizeRepoDelta(opt options, delta *github.RepoUpdateRequest) []error {
 	var errs []error
-	if delta.Archived != nil && !*delta.Archived {
-		delta.Archived = nil
-		errs = append(errs, fmt.Errorf("asked to unarchive an archived repo, unsupported by GH API"))
-	}
+	// Unarchival (an archived==false delta) is gated earlier in configureRepos,
+	// where a request to unarchive without --allow-repo-unarchival is warned and
+	// skipped; an allowed unarchival flows through here untouched. A non-archived
+	// repo never produces an archived==false delta, so no guard is needed for it.
 	if delta.Archived != nil && *delta.Archived && !opt.allowRepoArchival {
 		delta.Archived = nil
 		errs = append(errs, fmt.Errorf("asked to archive a repo but this is not allowed by default (see --allow-repo-archival)"))
@@ -1437,10 +1439,23 @@ func configureRepos(opt options, client repoClient, orgName string, orgConfig or
 
 		if existing != nil {
 			if existing.Archived {
-				if wantRepo.Archived != nil && *wantRepo.Archived {
+				// An archived repository is read-only in GitHub: the only change the
+				// API accepts is one that unarchives it (a PATCH setting
+				// archived:false, which may carry other field updates in the same
+				// request). Any update that leaves the repo archived would be
+				// rejected with a 403, so skip those outright.
+				switch {
+				case wantRepo.Archived == nil || *wantRepo.Archived:
 					repoLogger.Infof("repo %q is archived, skipping changes", wantName)
 					continue
+				case !opt.allowRepoUnarchival:
+					repoLogger.Warnf("repo %q is archived and config requests unarchival, but this is not allowed by default (see --allow-repo-unarchival); skipping", wantName)
+					continue
 				}
+				// Unarchival requested and allowed: fall through to the normal update
+				// path. The computed delta carries archived:false alongside any other
+				// drift, and GitHub applies them together in a single request.
+				repoLogger.Infof("repo %q is archived, unarchiving", wantName)
 			}
 			repoLogger.Info("repo exists, considering an update")
 			delta := newRepoUpdateRequest(*existing, wantName, wantRepo)
